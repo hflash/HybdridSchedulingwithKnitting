@@ -5,12 +5,424 @@ import os
 # from qiskit.providers.fake_provider import fake_provider
 from qiskit_ibm_runtime.fake_provider import FakeManilaV2, FakeGuadalupeV2, FakeHanoiV2, FakeMelbourneV2, FakeManhattanV2
 import math
-from CircuitCutting.iterationCircuitCut import read_circuit, compute_subcircuits_with_budget
+from iterationCircuitCut import read_circuit, compute_subcircuits_with_budget
 
 # 固定随机种子，稳定SABRE与其他启发式行为
 SEED_TRANSPILE = 12345
+import os
+import numpy as np
+from quantumcircuit.circuit import QuantumCircuit
+
+# ------------------------
+# 宏：执行正确率（可根据需要调整）
+# ------------------------
+TWO_Q_GATE_CORR = 0.9838782711905    # 两比特门执行正确率
+ONE_Q_GATE_CORR = 0.9995892369557831   # 单比特门执行正确率
+MEAS_CORR       = 0.9755874999999999    # 测量执行正确率（逐比特）
+DECO_CORR       = 0.999   # 退相干时间正确率（逐深度层）
+# 退相干模型宏：T为特征时间常数(秒)，AVG_GATE_TIME为平均门时长(秒)
+DECO_T          = 8.115298082762845e-05  # 示例：100微秒
+AVG_GATE_TIME   = 1.8133333333333334e-07   # 示例：50纳秒
 
 
+def compute_macros_from_backend(backend, main_twoq_candidates=("cx", "ecr")):
+    """
+    基于单个IBM Fake后端，提取用于宏的统计样本（不做聚合，仅收集）：
+    - 仅统计"主双比特门"（优先 'cx'，若无则 'ecr'），并将qargs按无向边去重
+    返回 dict:
+      {
+        'twoq_corrs': [float, ...],        # 主双比特门的(1-error)，无向去重
+        'oneq_corrs': [float, ...],        # 单比特门的(1-error)
+        'meas_corrs': [float, ...],        # 每个比特的(1-readout_error)
+        'gate_durations': [float, ...],    # 每个门的持续时间(秒)（含单双比特门），双比特无向去重
+        't1s': [float, ...],               # 每个比特的T1(秒)
+        'meta': { 'main_twoq': str|None }
+      }
+    """
+    samples = {
+        'twoq_corrs': [],
+        'oneq_corrs': [],
+        'meas_corrs': [],
+        'gate_durations': [],
+        't1s': [],
+        'meta': {'main_twoq': None},
+    }
+    try:
+        target = getattr(backend, 'target', None)
+        dt = None
+        try:
+            dt = getattr(target, 'dt', None)
+        except Exception:
+            dt = getattr(backend, 'dt', None)
+
+        # 选择主双比特门
+        main_twoq = None
+        try:
+            opset = set(getattr(target, 'operation_names', []) or []) if target is not None else set()
+            for cand in main_twoq_candidates:
+                if cand in opset:
+                    main_twoq = cand
+                    break
+        except Exception:
+            main_twoq = None
+        samples['meta']['main_twoq'] = main_twoq
+
+        if target is not None:
+            # 预先构建无向去重集合
+            seen_twoq_pairs = set()    # {(min(a,b), max(a,b))}
+            seen_dur_twoq = set()
+
+            for opname in getattr(target, 'operation_names', []):
+                props_map = target.get(opname)
+                if not props_map:
+                    continue
+                for qargs, props in props_map.items():
+                    if props is None:
+                        continue
+
+                    # 处理duration为秒
+                    try:
+                        dur = getattr(props, 'duration', None)
+                        if dur is not None:
+                            dval = float(dur)
+                            if dt and dval > 0 and float(dval).is_integer():
+                                dsec = dval * float(dt)
+                            else:
+                                dsec = dval
+                        else:
+                            dsec = None
+                    except Exception:
+                        dsec = None
+
+                    # 单/双比特分类
+                    try:
+                        if qargs is None:
+                            continue
+                        arity = len(qargs)
+                    except Exception:
+                        arity = 0
+
+                    # 正确率 = 1 - error
+                    corr = None
+                    try:
+                        if hasattr(props, 'error') and props.error is not None:
+                            corr = max(0.0, 1.0 - float(props.error))
+                    except Exception:
+                        corr = None
+
+                    # 测量门
+                    if str(opname).lower() == 'measure' and arity == 1:
+                        if corr is not None:
+                            samples['meas_corrs'].append(corr)
+                        # duration也纳入总体门时长样本
+                        if dsec is not None and dsec > 0:
+                            samples['gate_durations'].append(dsec)
+                        continue
+
+                    # 单比特门
+                    if arity == 1:
+                        if corr is not None:
+                            samples['oneq_corrs'].append(corr)
+                        if dsec is not None and dsec > 0:
+                            samples['gate_durations'].append(dsec)
+                        continue
+
+                    # 双比特门（仅统计主门，且无向去重）
+                    if arity == 2 and main_twoq is not None and str(opname).lower() == str(main_twoq).lower():
+                        try:
+                            a, b = int(qargs[0]), int(qargs[1])
+                        except Exception:
+                            # 若qargs不可转int，就跳过
+                            a, b = None, None
+                        if a is None or b is None:
+                            continue
+                        u, v = (a, b) if a < b else (b, a)
+                        pair = (u, v)
+                        if pair not in seen_twoq_pairs:
+                            if corr is not None:
+                                samples['twoq_corrs'].append(corr)
+                            if dsec is not None and dsec > 0 and pair not in seen_dur_twoq:
+                                samples['gate_durations'].append(dsec)
+                                seen_dur_twoq.add(pair)
+                            seen_twoq_pairs.add(pair)
+                        continue
+
+                    # 其他门（非主双比特门）仅用于时长样本（不计入twoq_corrs）
+                    if dsec is not None and dsec > 0:
+                        samples['gate_durations'].append(dsec)
+
+        # T1 from qubit_properties
+        if hasattr(backend, 'qubit_properties'):
+            try:
+                phys = list(getattr(target, 'physical_qubits', [])) if target is not None else None
+                if phys is None or len(phys) == 0:
+                    n = getattr(backend, 'num_qubits', 0) or 0
+                    phys = list(range(int(n)))
+                for i in phys:
+                    try:
+                        qp = backend.qubit_properties(int(i))
+                    except Exception:
+                        qp = None
+                    if qp is None:
+                        continue
+                    t1 = getattr(qp, 't1', None)
+                    if t1 is not None:
+                        try:
+                            t1v = float(t1)
+                            if t1v > 0:
+                                samples['t1s'].append(t1v)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return samples
+
+
+def _robust_summary(arr, trim_ratio=0.1):
+    """
+    对数列给出稳健统计：均值、截尾均值(默认10%)、中位数、P10、P90。
+    返回 dict: {'mean': float|None, 'tmean': float|None, 'median': float|None, 'p10': float|None, 'p90': float|None}
+    """
+    if not arr:
+        return {'mean': None, 'tmean': None, 'median': None, 'p10': None, 'p90': None}
+    a = np.array(arr, dtype=float)
+    a = a[~np.isnan(a)]
+    if a.size == 0:
+        return {'mean': None, 'tmean': None, 'median': None, 'p10': None, 'p90': None}
+    a_sorted = np.sort(a)
+    mean = float(np.mean(a_sorted))
+    median = float(np.median(a_sorted))
+    p10 = float(np.percentile(a_sorted, 10))
+    p90 = float(np.percentile(a_sorted, 90))
+    # 截尾均值
+    n = a_sorted.size
+    k = int(n * trim_ratio)
+    if k * 2 >= n:
+        tmean = mean
+    else:
+        tmean = float(np.mean(a_sorted[k:n - k]))
+    return {'mean': mean, 'tmean': tmean, 'median': median, 'p10': p10, 'p90': p90}
+
+
+def compute_ibm_fake_macro_averages():
+    """
+    计算宏的建议值，基于四个IBM Fake设备：
+      - FakeHanoiV2 (27)
+      - FakeGuadalupeV2 (16)
+      - FakeManhattanV2 (65)
+      - FakeMelbourneV2 (15)
+    规则：
+      - 仅统计主双比特门（优先'cx'，若无则'ecr'），对qargs按无向去重
+      - 使用稳健统计（中位数/截尾均值），先在每台设备内聚合，再在设备间求平均
+      - 返回顶层键作为推荐值（采用"设备内中位数"在设备间的平均），并附带详细统计以便审阅
+
+    返回：
+      {
+        'TWO_Q_GATE_CORR': float|None,   # 推荐值（跨设备平均的"设备内中位数"）
+        'ONE_Q_GATE_CORR': float|None,
+        'MEAS_CORR': float|None,
+        'DECO_T': float|None,            # T1为代表时间尺度
+        'AVG_GATE_TIME': float|None,
+        'details': {
+            'by_backend': [
+                { 'name': str, 'main_twoq': str|None,
+                  'twoq': {'mean','tmean','median','p10','p90'},
+                  'oneq': {...}, 'meas': {...}, 't1': {...}, 'dur': {...}
+                }, ...
+            ],
+            'across_devices': {
+                'twoq_medians': {'mean','tmean','median','p10','p90'},
+                'oneq_medians': {...},
+                'meas_medians': {...},
+                't1_medians': {...},
+                'dur_medians': {...}
+            }
+        }
+      }
+    """
+    backends = [FakeHanoiV2(), FakeGuadalupeV2(), FakeManhattanV2(), FakeMelbourneV2()]
+
+    per_backend = []
+    # 设备内聚合：计算各项稳健统计
+    for be in backends:
+        name = type(be).__name__
+        s = compute_macros_from_backend(be)
+        twoq_stats = _robust_summary(s.get('twoq_corrs', []))
+        oneq_stats = _robust_summary(s.get('oneq_corrs', []))
+        meas_stats = _robust_summary(s.get('meas_corrs', []))
+        t1_stats   = _robust_summary(s.get('t1s', []))
+        dur_stats  = _robust_summary(s.get('gate_durations', []))
+        per_backend.append({
+            'name': name,
+            'main_twoq': s.get('meta', {}).get('main_twoq'),
+            'twoq': twoq_stats,
+            'oneq': oneq_stats,
+            'meas': meas_stats,
+            't1': t1_stats,
+            'dur': dur_stats,
+        })
+
+    # 设备间再聚合：取"设备内中位数"的集合，再做稳健统计
+    def _collect_medians(key):
+        vals = []
+        for item in per_backend:
+            v = item.get(key, {}).get('median')
+            if v is not None:
+                vals.append(v)
+        return vals
+
+    twoq_meds = _collect_medians('twoq')
+    oneq_meds = _collect_medians('oneq')
+    meas_meds = _collect_medians('meas')
+    t1_meds   = _collect_medians('t1')
+    dur_meds  = _collect_medians('dur')
+
+    across = {
+        'twoq_medians': _robust_summary(twoq_meds),
+        'oneq_medians': _robust_summary(oneq_meds),
+        'meas_medians': _robust_summary(meas_meds),
+        't1_medians': _robust_summary(t1_meds),
+        'dur_medians': _robust_summary(dur_meds),
+    }
+
+    # 推荐值：采用"设备内中位数"的简单平均（若为空则None）
+    def _avg(vals):
+        return float(sum(vals) / len(vals)) if vals else None
+
+    macros = {
+        'TWO_Q_GATE_CORR': _avg(twoq_meds),
+        'ONE_Q_GATE_CORR': _avg(oneq_meds),
+        'MEAS_CORR': _avg(meas_meds),
+        'DECO_T': _avg(t1_meds),
+        'AVG_GATE_TIME': _avg(dur_meds),
+        'details': {
+            'by_backend': per_backend,
+            'across_devices': across,
+        }
+    }
+    return macros
+
+
+def _extract_circuit_stats(qc):
+    """
+    提取线路统计信息：两比特门数、单比特门数、测量比特数、线路深度。
+    兼容Qiskit样式(具有data、depth等)或自定义电路对象（尽量回退）。
+    返回: (num_twoq, num_oneq, num_meas_qubits, depth)
+    """
+    num_twoq = 0
+    num_oneq = 0
+    meas_qubits = set()
+    depth = 0
+
+    # 1) 深度（优先使用属性/方法）
+    try:
+        if hasattr(qc, 'depth'):
+            d = qc.depth() if callable(qc.depth) else qc.depth
+            depth = int(d) if d is not None else 0
+    except Exception:
+        depth = 0
+
+    # 2) 遍历指令（Qiskit风格）
+    try:
+        data = getattr(qc, 'data', None)
+        if data is not None:
+            for inst, qargs, _ in data:
+                name = getattr(inst, 'name', '').lower()
+                qlen = len(qargs) if qargs is not None else 0
+                if name == 'measure':
+                    # 记录被测量的量子比特索引
+                    for q in (qargs or []):
+                        idx = getattr(q, '_index', getattr(q, 'index', None))
+                        if idx is not None:
+                            meas_qubits.add(int(idx))
+                else:
+                    if qlen == 2:
+                        num_twoq += 1
+                    elif qlen == 1:
+                        num_oneq += 1
+            return num_twoq, num_oneq, len(meas_qubits), depth
+    except Exception:
+        pass
+
+    # 3) 回退：若有操作计数接口（如count_ops或ops字典）
+    try:
+        if hasattr(qc, 'count_ops') and callable(getattr(qc, 'count_ops')):
+            ops = qc.count_ops()
+            # 常见双比特门
+            for k, v in ops.items():
+                key = str(k).lower()
+                if key in {'cx', 'cz', 'swap', 'ecr'}:
+                    num_twoq += int(v)
+            # 常见单比特门（粗略）
+            for k, v in ops.items():
+                key = str(k).lower()
+                if key in {'x','y','z','h','s','sdg','t','tdg','rx','ry','rz','u','u3','id','sx'}:
+                    num_oneq += int(v)
+            # 测量数量未知情况下：取0（可按需扩展接口）
+            return num_twoq, num_oneq, len(meas_qubits), depth
+    except Exception:
+        pass
+
+    # 4) 全部失败则返回零统计
+    return num_twoq, num_oneq, len(meas_qubits), depth
+
+
+def compute_fidelity_requirement(qc):
+    """
+    基于宏常量与线路属性，计算"保真度要求"。
+    模型：
+      fidelity_req = (TWO_Q_GATE_CORR ^ 两比特门数)
+                     * (ONE_Q_GATE_CORR ^ 单比特门数)
+                     * (MEAS_CORR ^ 测量比特数)
+                     * (DECO_CORR ^ 线路深度)
+    入参：
+      qc: Qiskit 量子线路或兼容对象（需尽可能具有 data/depth 接口，或 count_ops 回退）
+    返回：
+      dict {
+        'two_qubit_gates': int,
+        'one_qubit_gates': int,
+        'measured_qubits': int,
+        'depth': int,
+        'fidelity_requirement': float,
+        'macros': { 'TWO_Q_GATE_CORR': float, 'ONE_Q_GATE_CORR': float, 'MEAS_CORR': float, 'DECO_CORR': float }
+      }
+    """
+    num_twoq, num_oneq, _ignored_meas, depth = _extract_circuit_stats(qc)
+    # 测量比特数 = 线路比特数（不依赖最终是否显式测量）
+    try:
+        num_meas_qubits = int(getattr(qc, 'num_qubits', 0))
+    except Exception:
+        num_meas_qubits = 0
+    # 退相干因子改为: (1 - exp(-t / T)) ^ 执行时间，其中 执行时间 = depth * AVG_GATE_TIME
+    # 注意：此处"^执行时间"为按秒的实数次幂（即连续时间近似）。
+    # 若需使用离散步长，可自行改为按层累乘。
+    import math
+    t_seconds = depth * AVG_GATE_TIME
+    deco_factor = (1.0 - math.exp(-t_seconds / DECO_T)) ** (t_seconds if t_seconds > 0 else 0.0)
+
+    fidelity_req = (TWO_Q_GATE_CORR ** int(num_twoq)) \
+                 * (ONE_Q_GATE_CORR ** int(num_oneq)) \
+                 * (MEAS_CORR       ** int(num_meas_qubits)) \
+                 * float(deco_factor)
+    return {
+        'two_qubit_gates': int(num_twoq),
+        'one_qubit_gates': int(num_oneq),
+        'measured_qubits': int(num_meas_qubits),
+        'depth': int(depth),
+        'exec_time_seconds': float(t_seconds),
+        'deco_factor': float(deco_factor),
+        'fidelity_requirement': float(fidelity_req),
+        'macros': {
+            'TWO_Q_GATE_CORR': TWO_Q_GATE_CORR,
+            'ONE_Q_GATE_CORR': ONE_Q_GATE_CORR,
+            'MEAS_CORR': MEAS_CORR,
+            'DECO_CORR': DECO_CORR,
+            'DECO_T': DECO_T,
+            'AVG_GATE_TIME': AVG_GATE_TIME,
+        }
+    }
 
 
 def _schedule_circuit_for_timing(circ, backend):
@@ -414,7 +826,7 @@ def _avg_gate_fidelity_in_region(backend, region, two_q_gate_name='cx'):
 
 def find_best_region_by_avg_performance(circ, backend, two_q_gate_name='cx', excluded_qubits=None, weight=0.5, max_regions=200):
     """
-    在芯片上找到一个“平均性能最好”的连通区域，区域大小等于电路比特数。
+    在芯片上找到一个"平均性能最好"的连通区域，区域大小等于电路比特数。
     性能度量 = weight * 平均门保真度 + (1-weight) * 区域连通性(边密度)。
     - 平均门保真度: 区域内单/双比特门的平均(1-error)
     - 连通性: 区域子图的边密度 = |E_region| / (n*(n-1)/2)
@@ -475,7 +887,7 @@ def allocate_regions_for_circuits(circuits, backend, two_q_gate_name='cx', exclu
     """
     为多条线路按优先级（列表下标越小优先级越高）分配芯片上的连通区域。
     约束：区域大小等于各线路比特数；各区域互不重叠；可排除指定物理比特。
-    目标：优先级越高的线路，其区域“平均性能”（门保真度与连通性加权）越好。
+    目标：优先级越高的线路，其区域"平均性能"（门保真度与连通性加权）越好。
 
     返回：列表，与circuits等长。每项为dict：
       {
@@ -713,7 +1125,7 @@ def _backend_from_name(chip_name: str):
 def assign_regions_and_estimates(circuits, chip_name: str, weight: float = 0.5, excluded_qubits=None, two_q_gate_name: str = 'cx', max_regions_each: int = 200):
     """
     1) 给定多条量子线路（按列表顺序高优先级在前）和芯片名称，
-       为每条线路分配互不重叠的连通区域（优先级高的区域“平均性能”更好），
+       为每条线路分配互不重叠的连通区域（优先级高的区域"平均性能"更好），
        并返回每条线路的区域、执行时间和保真度。
 
     返回: List[{
@@ -810,59 +1222,242 @@ def estimate_best_fidelity_and_logical_stats(circuit, chip_name: str, two_q_gate
     }
 
 
-if __name__ == "__main__":
+def estimate_partition_budgets(
+    qc,
+    device_qubit_max: int,
+    B0: float = 1.0,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    eta: float = 1.0,
+    gammas: tuple = (0.5, 1.0, 2.0),
+    required_fidelity: float | None = None,
+    ratio_req_over_est: float | None = 1.1,
+):
+    """
+    基于给定材料估计单条线路的三档分割预算（仅计采样聚合开销）。
 
+    定义：
+      - 宽度占比 r_Q(i) = |Q_i| / Q_max^{dev}
+      - 双比特门密度 d_{2q}(i) = |G_{2q,i}| / |Q_i|
+      - 组合大小因子 S_i = r_Q(i)^alpha * d_{2q}(i)^beta
+      - 集群噪声近似 \bar{F}_{cluster}(i) ≈ (1-ε_dec(t))^{|Q_i|} (1-ε_1q)^{|G_{1q,i}|} (1-ε_2q)^{|G_{2q,i}|} (1-ε_ro)^{|M_i|}
+        其中：
+          ε_1q = 1 - ONE_Q_GATE_CORR, ε_2q = 1 - TWO_Q_GATE_CORR, ε_ro = 1 - MEAS_CORR；
+          退相干误差 ε_dec(t) = 1 - exp(-t / DECO_T)；t = depth * AVG_GATE_TIME。
+      - 需求权重 H_i = (ratio)^eta，其中 ratio = (需求/估计) 的比值；若未显式给定 ratio_req_over_est，则回退为 (F_min^i / \bar{F}_{cluster}(i))。
+      - 基线预算 B_i^{base} = B0 * S_i * H_i
+      - 三档预算 {B^{(L)}, B^{(M)}, B^{(H)}} = {Γ_L, Γ_M, Γ_H} * B_i^{base}
+
+    入参：
+      - qc: 线路（Qiskit QuantumCircuit 或兼容对象）
+      - device_qubit_max: 设备可用最大比特数 Q_max^{dev}
+      - B0, alpha, beta, eta: 标定常数
+      - gammas: (Γ_L, Γ_M, Γ_H)
+      - required_fidelity: 若提供，直接作为 F_min^i；否则调用 compute_fidelity_requirement 估计（仅用于回退比值）
+      - ratio_req_over_est: 外部给定的"需求/估计"比值，默认1.1；若为None，则回退为 (F_min^i / \bar{F}_{cluster}(i))。
+
+    返回：dict
+      {
+        'width': |Q_i|,
+        'twoq_gates': |G_{2q,i}|,
+        'oneq_gates': |G_{1q,i}|,
+        'meas_qubits': |M_i|,
+        'r_Q': float,
+        'd_2q': float,
+        'S': float,
+        'F_cluster': float,            # 含时间相关退相干项
+        'F_cluster_factors': {         # 各因子便于检查
+            'F_deco': float,           # (1-ε_dec(t))^{|Q|}
+            'F_1q': float,
+            'F_2q': float,
+            'F_ro': float,
+            't_seconds': float,
+        },
+        'F_min': float,
+        'ratio_used': float,           # 用于计算H的(需求/估计)比值
+        'H': float,
+        'B_base': float,
+        'budgets_float': {'L': float, 'M': float, 'H': float},
+        'budgets_int':   {'L': int,   'M': int,   'H': int  },  # ceil 为整数预算
+      }
+    """
+    # 线路规模
+    try:
+        width = int(getattr(qc, 'num_qubits', 0))
+    except Exception:
+        width = 0
+    if width <= 0 or device_qubit_max <= 0:
+        return {
+            'width': width,
+            'twoq_gates': 0,
+            'oneq_gates': 0,
+            'meas_qubits': 0,
+            'r_Q': 0.0,
+            'd_2q': 0.0,
+            'S': 0.0,
+            'F_cluster': 0.0,
+            'F_cluster_factors': {'F_deco': 0.0, 'F_1q': 0.0, 'F_2q': 0.0, 'F_ro': 0.0, 't_seconds': 0.0},
+            'F_min': 0.0,
+            'ratio_used': 0.0,
+            'H': 0.0,
+            'B_base': 0.0,
+            'budgets_float': {'L': 0.0, 'M': 0.0, 'H': 0.0},
+            'budgets_int':   {'L': 0,   'M': 0,   'H': 0  },
+        }
+
+    # 计数信息
+    num_twoq, num_oneq, _ignored_meas, _depth = _extract_circuit_stats(qc)
+    # 测量比特数 = 线路比特数
+    meas_qubits = width
+
+    # 尺寸与密度
+    r_Q = float(width) / float(device_qubit_max)
+    d_2q = (float(num_twoq) / float(width)) if width > 0 else 0.0
+    # 组合大小因子
+    S = (r_Q ** float(alpha)) * (d_2q ** float(beta)) if (r_Q > 0 and d_2q > 0) else 0.0
+
+    # 时间：t = depth * AVG_GATE_TIME
+    try:
+        depth = int(getattr(qc, 'depth')() if callable(getattr(qc, 'depth', None)) else getattr(qc, 'depth', 0))
+    except Exception:
+        depth = 0
+    t_seconds = float(depth) * float(AVG_GATE_TIME)
+
+    # 集群噪声近似（用宏平均误差 + 时间相关退相干）
+    eps_1q = max(0.0, 1.0 - float(ONE_Q_GATE_CORR))
+    eps_2q = max(0.0, 1.0 - float(TWO_Q_GATE_CORR))
+    eps_ro = max(0.0, 1.0 - float(MEAS_CORR))
+    # 退相干平均误差（基于宏DECO_T）：ε_dec(t) = 1 - exp(-t/DECO_T)
+    if float(DECO_T) > 0.0 and t_seconds > 0.0:
+        eps_dec = 1.0 - math.exp(-t_seconds / float(DECO_T))
+        F_deco = (1.0 - eps_dec) ** int(width)  # 等价于 exp(-width * t / T)
+    else:
+        eps_dec = 0.0
+        F_deco = 1.0
+
+    F_1q = (1.0 - eps_1q) ** int(num_oneq)
+    F_2q = (1.0 - eps_2q) ** int(num_twoq)
+    F_ro = (1.0 - eps_ro) ** int(meas_qubits)
+    F_cluster = F_deco * F_1q * F_2q * F_ro
+
+    # 需求保真度 F_min（仅用于回退比值）
+    if required_fidelity is None:
+        try:
+            req_stats = compute_fidelity_requirement(qc)
+            F_min = float(req_stats.get('fidelity_requirement', 0.0))
+        except Exception:
+            F_min = 0.0
+    else:
+        F_min = float(required_fidelity)
+
+    # 需求/估计保真度比（外部给定优先，None时回退为F_min/F_cluster）
+    if ratio_req_over_est is not None:
+        ratio_used = max(0.0, float(ratio_req_over_est))
+    else:
+        if F_cluster <= 0.0:
+            ratio_used = float('inf') if F_min > 0 else 0.0
+        else:
+            ratio_used = max(0.0, F_min / F_cluster)
+    H = ratio_used ** float(eta)
+
+    # 基线预算与三档预算
+    B_base = float(B0) * float(S) * float(H)
+    gamma_L, gamma_M, gamma_H = gammas if isinstance(gammas, (list, tuple)) and len(gammas) == 3 else (0.5, 1.0, 2.0)
+    B_L = gamma_L * B_base
+    B_M = gamma_M * B_base
+    B_H = gamma_H * B_base
+
+    # 输出（同时提供向上取整的整数预算）
+    def _ceil_pos(x: float) -> int:
+        if not math.isfinite(x) or x <= 0:
+            return 0
+        return int(math.ceil(x))
+
+    return {
+        'width': int(width),
+        'twoq_gates': int(num_twoq),
+        'oneq_gates': int(num_oneq),
+        'meas_qubits': int(meas_qubits),
+        'r_Q': float(r_Q),
+        'd_2q': float(d_2q),
+        'S': float(S),
+        'F_cluster': float(F_cluster),
+        'F_cluster_factors': {
+            'F_deco': float(F_deco),
+            'F_1q': float(F_1q),
+            'F_2q': float(F_2q),
+            'F_ro': float(F_ro),
+            't_seconds': float(t_seconds),
+        },
+        'F_min': float(F_min),
+        'ratio_used': float(ratio_used),
+        'H': float(H),
+        'B_base': float(B_base),
+        'budgets_float': {'L': float(B_L), 'M': float(B_M), 'H': float(B_H)},
+        'budgets_int':   {'L': _ceil_pos(B_L), 'M': _ceil_pos(B_M), 'H': _ceil_pos(B_H)},
+    }
+
+if __name__ == "__main__":
+    # macros = compute_ibm_fake_macro_averages()
+    # print(macros)
+    # 可选：将全局宏覆盖为建议均值
+    # if macros['TWO_Q_GATE_CORR'] is not None: TWO_Q_GATE_CORR = macros['TWO_Q_GATE_CORR']
+    # if macros['ONE_Q_GATE_CORR'] is not None: ONE_Q_GATE_CORR = macros['ONE_Q_GATE_CORR']
+    # if macros['MEAS_CORR'] is not None: MEAS_CORR = macros['MEAS_CORR']
+    # if macros['DECO_T'] is not None: DECO_T = macros['DECO_T']
+    # if macros['AVG_GATE_TIME'] is not None: AVG_GATE_TIME = macros['AVG_GATE_TIME']
     base_path = "/home/normaluser/hflash/HybdridSchedulingwithKnitting/Benchmark/"
     test_circuit_path = os.path.join(base_path, "pra_benchmark", "small_scale", "cm82a_208.qasm")
-    circuit = QuantumCircuit.from_qasm_file(test_circuit_path)
-    coupling_map_all = []
-    num_qubits = 100
-    # for i in range(num_qubits):
-    #     for j in range(num_qubits):
-    #         if i != j:
-    #             coupling_map_all.append([i, j])
+    # circuit = QuantumCircuit.from_qasm_file(test_circuit_path)
+    circuit = read_circuit(test_circuit_path)
+    # coupling_map_all = []
+    # num_qubits = 100
+    # # for i in range(num_qubits):
+    # #     for j in range(num_qubits):
+    # #         if i != j:
+    # #             coupling_map_all.append([i, j])
 
-    for i in range(num_qubits - 1) :
-        coupling_map_all.append([i, i+1])
+    # for i in range(num_qubits - 1) :
+    #     coupling_map_all.append([i, i+1])
 
-    backend = GenericBackendV2(basis_gates=["x", "y", "z", "h", "s", "t", "cx", "rx", "rz", "ry", "tdg"],
-                                num_qubits=num_qubits, coupling_map=coupling_map_all)
+    # backend = GenericBackendV2(basis_gates=["x", "y", "z", "h", "s", "t", "cx", "rx", "rz", "ry", "tdg"],
+    #                             num_qubits=num_qubits, coupling_map=coupling_map_all)
     backend2 = FakeMelbourneV2()
-    circuit_transpile = transpile(circuit, basis_gates=["x", "y", "z", "h", "s", "t", "cx", "rx", "rz", "ry", "tdg"],layout_method='sabre', routing_method='sabre', backend=backend2, seed_transpiler=SEED_TRANSPILE)
+    # circuit_transpile = transpile(circuit, basis_gates=["x", "y", "z", "h", "s", "t", "cx", "rx", "rz", "ry", "tdg"],layout_method='sabre', routing_method='sabre', backend=backend2, seed_transpiler=SEED_TRANSPILE)
 
-    # print(circuit_transpile.layout)
-    print(circuit_transpile.depth())
-    # print(circuit_transpile.)
+    # # print(circuit_transpile.layout)
+    # print(circuit_transpile.depth())
+    # # print(circuit_transpile.)
 
-    # 估计时间与保真度
-    est_seconds, est_fidelity = estimate_time_and_fidelity(circuit_transpile, backend2)
-    print(f"Estimated exec time (s): {est_seconds}")
-    print(f"Estimated overall fidelity: {est_fidelity}")
+    # # 估计时间与保真度
+    # est_seconds, est_fidelity = estimate_time_and_fidelity(circuit_transpile, backend2)
+    # print(f"Estimated exec time (s): {est_seconds}")
+    # print(f"Estimated overall fidelity: {est_fidelity}")
 
-    # 选择芯片上的一片区域（物理比特编号）
-    # region = [3, 4, 7, 8, 11, 12, 13, 14]  # 举例
+    # # 选择芯片上的一片区域（物理比特编号）
+    # # region = [3, 4, 7, 8, 11, 12, 13, 14]  # 举例
 
-    # # 将原始/转译电路映射到该区域
-    # mapped_circ = transpile_to_region(circuit, backend2, region)
+    # # # 将原始/转译电路映射到该区域
+    # # mapped_circ = transpile_to_region(circuit, backend2, region)
 
-    # # 继续评估时间与保真度
+    # # # 继续评估时间与保真度
+    # # secs, fid = estimate_time_and_fidelity(mapped_circ, backend2)
+    # # print(secs, fid)
+    # # 示例：基于FakeMelbourneV2在芯片上寻找与电路规模匹配的连通区域
+    # try:
+    #     excluded = {0, 1, 2}  # 不使用的物理比特
+    #     regions = find_feasible_regions_for_circuit(circuit, backend2, excluded_qubits=excluded, max_regions=5)
+    #     print(regions)
+    # except Exception as e:
+    #     print("Region search failed:", e)
+
+
+    # # # 将原始/转译电路映射到该区域
+    # mapped_circ = transpile_to_region(circuit, backend2, regions[2])
+
+    # # # 继续评估时间与保真度
     # secs, fid = estimate_time_and_fidelity(mapped_circ, backend2)
     # print(secs, fid)
-    # 示例：基于FakeMelbourneV2在芯片上寻找与电路规模匹配的连通区域
-    try:
-        excluded = {0, 1, 2}  # 不使用的物理比特
-        regions = find_feasible_regions_for_circuit(circuit, backend2, excluded_qubits=excluded, max_regions=5)
-        print(regions)
-    except Exception as e:
-        print("Region search failed:", e)
-
-
-    # # 将原始/转译电路映射到该区域
-    mapped_circ = transpile_to_region(circuit, backend2, regions[2])
-
-    # # 继续评估时间与保真度
-    secs, fid = estimate_time_and_fidelity(mapped_circ, backend2)
-    print(secs, fid)
 
 
     # 示例：搜索平均性能最优的区域 执行
@@ -873,46 +1468,86 @@ if __name__ == "__main__":
         print("Best region search failed:", e)
 
 
-    # # 将原始/转译电路映射到该区域
-    # print
+    # # # 将原始/转译电路映射到该区域
+    # # print
     mapped_circ = transpile_to_region(circuit, backend2, best_region['region'])
 
-    # # 继续评估时间与保真度
-    secs, fid = estimate_time_and_fidelity(mapped_circ, backend2)
-    print(secs, fid)
+    # # # 继续评估时间与保真度
+    # secs, fid = estimate_time_and_fidelity(mapped_circ, backend2)
+    # print(secs, fid)
 
 
-    # 测试多个线路一起执行
-    backend3 = FakeHanoiV2()
-    # 示例（如需测试，取消注释）：
-    circuits_list = [circuit]*2  # 多条线路按优先级排列
-    alloc = allocate_regions_for_circuits(
-        circuits_list, backend3,
-        two_q_gate_name='cx',
-        excluded_qubits=None,  # 可传入初始不可用比特
-        weight=0.6,            # 保真度 vs 连通性 权重
-        max_regions_each=200   # 每条线路候选上限
+    # # 测试多个线路一起执行
+    # backend3 = FakeHanoiV2()
+    # # 示例（如需测试，取消注释）：
+    # circuits_list = [circuit]*2  # 多条线路按优先级排列
+    # alloc = allocate_regions_for_circuits(
+    #     circuits_list, backend3,
+    #     two_q_gate_name='cx',
+    #     excluded_qubits=None,  # 可传入初始不可用比特
+    #     weight=0.6,            # 保真度 vs 连通性 权重
+    #     max_regions_each=200   # 每条线路候选上限
+    # )
+    # for item in alloc:
+    #     print(item['index'], item['status'], item['region'], item['score'], item['est_seconds'], item['est_fidelity'])
+
+
+
+    # # 测试对cnot数目和swap数目的计算
+    # mapped = transpile_to_region(circuit, backend2, best_region['region'])
+    # initial_layout = list(best_region['region'])[: circuit.num_qubits]  # 逻辑→物理初始映射
+    # stats_logical = compute_swap_cnot_counts_per_logical(circuit, mapped, initial_layout)
+    # # 找影响最大的逻辑比特（比值最大）
+    # # print_circuit_gates(mapped)
+    # most_logical = max(
+    #     (l for l, v in stats_logical.items() if v['ratio'] is not None),
+    #     key=lambda l: stats_logical[l]['ratio'],
+    #     default=None
+    # )
+    # print(stats_logical, most_logical)
+
+    # print(assign_regions_and_estimates([circuit]*2, 'FakeHanoiV2', weight=0.5, excluded_qubits=None, two_q_gate_name='cx', max_regions_each=200))
+
+    # print(estimate_best_fidelity_and_logical_stats(circuit, 'FakeHanoiV2', two_q_gate_name='cx', max_regions=200, excluded_qubits=None))
+
+
+    stats = compute_fidelity_requirement(mapped_circ)
+    print("two_qubit_gates:", stats['two_qubit_gates'])
+    print("one_qubit_gates:", stats['one_qubit_gates'])
+    print("measured_qubits:", stats['measured_qubits'])
+    print("depth:", stats['depth'])
+    print("exec_time_seconds:", stats['exec_time_seconds'])
+    print("deco_factor:", stats['deco_factor'])
+    print("fidelity_requirement:", stats['fidelity_requirement'])
+    print("macros:", stats['macros'])
+
+    # 路径与后端
+    base_path = "/home/normaluser/hflash/HybdridSchedulingwithKnitting/Benchmark/"
+    qasm_path = base_path + "pra_benchmark/small_scale/cm82a_208.qasm"
+    backend = FakeMelbourneV2()
+    qc = read_circuit(qasm_path)
+
+    # 找一个最佳区域并映射，用其执行时间作为预算函数的 t
+    best = find_best_region_by_avg_performance(qc, backend, two_q_gate_name='cx', excluded_qubits=None, weight=0.5, max_regions=200)
+    region = best['region']
+    mapped = transpile_to_region(qc, backend, region)
+    t_seconds, _ = estimate_time_and_fidelity(mapped, backend)
+
+    # 设备规模（示例：Melbourne 15）
+    device_qubit_max = backend.num_qubits
+
+    # 估计三档预算
+    res = estimate_partition_budgets(
+        qc,
+        device_qubit_max=device_qubit_max,
+        B0=1.0, alpha=1.0, beta=1.0, eta=1.0,
+        gammas=(0.5, 1.0, 2.0)
     )
-    for item in alloc:
-        print(item['index'], item['status'], item['region'], item['score'], item['est_seconds'], item['est_fidelity'])
 
-
-
-    # 测试对cnot数目和swap数目的计算
-    mapped = transpile_to_region(circuit, backend2, best_region['region'])
-    initial_layout = list(best_region['region'])[: circuit.num_qubits]  # 逻辑→物理初始映射
-    stats_logical = compute_swap_cnot_counts_per_logical(circuit, mapped, initial_layout)
-    # 找影响最大的逻辑比特（比值最大）
-    # print_circuit_gates(mapped)
-    most_logical = max(
-        (l for l, v in stats_logical.items() if v['ratio'] is not None),
-        key=lambda l: stats_logical[l]['ratio'],
-        default=None
-    )
-    print(stats_logical, most_logical)
-
-    print(assign_regions_and_estimates([circuit]*2, 'FakeHanoiV2', weight=0.5, excluded_qubits=None, two_q_gate_name='cx', max_regions_each=200))
-
-    print(estimate_best_fidelity_and_logical_stats(circuit, 'FakeHanoiV2', two_q_gate_name='cx', max_regions=200, excluded_qubits=None))
-
+    print("budgets_float:", res['budgets_float'])
+    print("budgets_int:", res['budgets_int'])
+    print("F_cluster:", res['F_cluster'])
+    print("F_cluster_factors:", res['F_cluster_factors'])
+    print("S, r_Q, d_2q:", res['S'], res['r_Q'], res['d_2q'])
+    print("F_min, H, B_base:", res['F_min'], res['H'], res['B_base'])
     

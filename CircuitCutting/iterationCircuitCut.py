@@ -591,7 +591,7 @@ def max_ratio_qubit_per_subcircuit(circuit, membership, chip_name, two_q_gate_na
         # 这里subcircuits的顺序与groups顺序一致
         subcircuit = subcircuits[groups.index(group)]
 
-        # 在设备上为该子线路找一个“平均性能”最优的区域（规模=子线路比特数）
+        # 在设备上为该子线路找一个"平均性能"最优的区域（规模=子线路比特数）
         best = find_best_region_by_avg_performance(
             subcircuit, backend,
             two_q_gate_name=two_q_gate_name,
@@ -961,7 +961,7 @@ def _fmt_float(x, nan='-'):
 
 def print_swap_pairs_report(pairs_eval, top_k=None):
     """
-    按“割更小更好、保真度更高更好”的原则，对两两交换结果进行排序并清晰打印。
+    按"割更小更好、保真度更高更好"的原则，对两两交换结果进行排序并清晰打印。
     - 排序键：先按割变化delta升序（负数更优），再按两子线路保真度总变化降序，其次按两子线路执行时间总变化升序。
     - 每条目打印：分组对、参与交换的逻辑比特、各自ratio、割变化、两子线路保真度/深度/时间前后与变化、结论。
     """
@@ -1034,7 +1034,7 @@ def test_pra_benchmark_swaps(chip_name,
     """
     遍历pra benchmark文件夹中的所有.qasm线路：
     - 对每个线路进行metis分割（parts_k个子线路）
-    - 计算两两子线路交换“swap/cx最高逻辑比特”的割变化与保真度变化
+    - 计算两两子线路交换"swap/cx最高逻辑比特"的割变化与保真度变化
     - 打印清晰报告并返回汇总结果
 
     Args:
@@ -1155,8 +1155,8 @@ def compute_subcircuits_with_budget(circuit, budget, device_qubit_max,
     - 即使电路本身不超过device_qubit_max，也会尝试用预算做更多分割（增加parts）。
     - 若提供chip_name，并且初次分割后仍有剩余预算，则进一步尝试：
       1) 借助两两子线路交换（优先交换各子线路swap/cx比值最高的逻辑比特），若交换新增cut不超过剩余预算且提升总保真度，则应用交换
-      2) 否则尝试“二次冻结”：增加删除的最高度数比特数目，在预算内寻找更充分利用预算的方案
-    - 若所有尝试均超预算，则返回“无法执行，需增加预算”。
+      2) 否则尝试"二次冻结"：增加删除的最高度数比特数目，在预算内寻找更充分利用预算的方案
+    - 若所有尝试均超预算，则返回"无法执行，需增加预算"。
 
     返回:
       dict {
@@ -1254,7 +1254,7 @@ def compute_subcircuits_with_budget(circuit, budget, device_qubit_max,
         except Exception:
             pass
 
-    # 若仍有剩余预算，尝试“二次冻结”最高度数比特
+    # 若仍有剩余预算，尝试"二次冻结"最高度数比特
     if leftover > 0:
         try:
             # 在更大删除范围内重新搜索（不小于当前删除数）
@@ -1278,6 +1278,9 @@ def compute_subcircuits_with_budget(circuit, budget, device_qubit_max,
 
     subcircuits = extract_sub_circuit(circuit, membership)
 
+    # 统计每个子线路与其他子线路之间的割数量
+    per_group_cut_counts = compute_per_group_cut_counts(G, membership)
+
     return {
         'status': 'ok',
         'message': None,
@@ -1290,7 +1293,34 @@ def compute_subcircuits_with_budget(circuit, budget, device_qubit_max,
         'parts': parts,
         'post_swap_applied': post_swap_applied,
         'post_swap_info': post_swap_info,
+        'per_subcircuit_cut_counts': per_group_cut_counts,
     }
+
+
+def compute_per_group_cut_counts(G, membership):
+    """
+    按分组统计每个子线路与其他子线路之间的割数量（带权重）。
+    规则：
+    - membership[i] == -1 的比特忽略；
+    - 对于跨组边(u,v)，其权重同时计入两个端点所属分组的计数。
+    返回：dict[group_id -> int]
+    """
+    group_ids = sorted(set(m for m in membership if m != -1))
+    counts = {g: 0 for g in group_ids}
+    for u, v, data in G.edges(data=True):
+        mu = membership[u] if u < len(membership) else None
+        mv = membership[v] if v < len(membership) else None
+        if mu is None or mv is None:
+            continue
+        if mu == -1 or mv == -1:
+            continue
+        if mu != mv:
+            w = data.get('weight', 1)
+            if mu in counts:
+                counts[mu] += w
+            if mv in counts:
+                counts[mv] += w
+    return counts
 
 
 if __name__ == "__main__":
@@ -1475,6 +1505,12 @@ if __name__ == "__main__":
                 print(f"生成子线路数: {len(res['subcircuits'])}")
                 for i, sc in enumerate(res['subcircuits']):
                     print(f"  子线路 {i}: qubits={sc.num_qubits}, depth={sc.depth()}")
+                # 新增：打印每个子线路与其他子线路之间的割数量(权重和)
+                per_counts = res.get('per_subcircuit_cut_counts', {})
+                if per_counts:
+                    print("各子线路与其他子线路之间的割数量(权重和):")
+                    for g in sorted(per_counts.keys()):
+                        print(f"  组 {g}: {per_counts[g]}")
             else:
                 print("无法执行，需增加预算")
         except Exception as e:
