@@ -155,7 +155,7 @@ class Circuit:
             #todo 计算保真度
             pass
         return self.fidelity
-    
+
     def compute_budget(self):
         # 调用 estimate_partition_budgets 估计三档预算，并设置默认预算为中档(M)
         try:
@@ -246,18 +246,23 @@ class QPU:
         # 1. 计算最早开始时间
         earliest_start = self._find_earliest_start_time(required_qubits, current_time)
         
-        # 2. 使用performanceAccessing函数估算执行时间
+        # 2. 使用performanceAccessing函数估算执行时间（考虑当前时刻占用比特作为excluded_qubits）
         try:
             from CircuitCutting.performanceAccessing import estimate_best_fidelity_and_logical_stats
-            # 调用性能评估函数获取执行时间
-            fidelity_stats = estimate_best_fidelity_and_logical_stats(circuit, self.backend_name)
+            occupied = set(self._get_occupied_qubits_at_time(current_time))
+            fidelity_stats = estimate_best_fidelity_and_logical_stats(
+                circuit,
+                self.backend_name,
+                two_q_gate_name='cx',
+                max_regions=200,
+                excluded_qubits=occupied if occupied else None,
+            )
             if fidelity_stats and 'best_seconds' in fidelity_stats:
                 estimated_seconds = fidelity_stats['best_seconds']
             else:
-                # 如果无法获取，使用默认值
+                print("无法获取执行时间")
                 estimated_seconds = 1.0
         except ImportError:
-            # 如果无法导入模块，使用默认值
             estimated_seconds = 1.0
         
         # 3. 计算实际执行时间（考虑设备状态）
@@ -287,12 +292,18 @@ class QPU:
         # 1. 计算最早开始时间
         earliest_start = self._find_earliest_start_time(required_qubits, current_time)
         
-        # 2. 使用performanceAccessing函数估算执行时间
+        # 2. 使用performanceAccessing函数估算执行时间（考虑当前时刻占用比特作为excluded_qubits）
         try:
             from CircuitCutting.performanceAccessing import estimate_best_fidelity_and_logical_stats
-            # 调用性能评估函数获取执行时间
-            #Todo 需要修改: 下面的估计需要考虑earliest_start时候的空闲区域
-            fidelity_stats = estimate_best_fidelity_and_logical_stats(circuit, self.backend_name)
+            # 使用 earliest_start 时刻的占用集合进行估计
+            occupied = set(self._get_occupied_qubits_at_time(earliest_start))
+            fidelity_stats = estimate_best_fidelity_and_logical_stats(
+                circuit,
+                self.backend_name,
+                two_q_gate_name='cx',
+                max_regions=200,
+                excluded_qubits=occupied if occupied else None,
+            )
             if fidelity_stats and 'best_seconds' in fidelity_stats:
                 estimated_seconds = fidelity_stats['best_seconds']
             else:
@@ -468,12 +479,13 @@ class Scheduler:
     def __init__(self, qpus: list[QPU], circuits: list[Circuit]):
         self.qpus = qpus
         self.circuits: list[Circuit] = circuits
+        self.executed_tasks = []
         # 移除重复的设备状态跟踪，使用QPU类内置的时间线管理
     
     def add_circuit(self, circuit: Circuit):
         """添加电路到调度器"""
         self.circuits.append(circuit)
-
+    
     def cut_circuits(self):
         for circuit in self.circuits:
             circuit.cut(self.qpus)
@@ -627,49 +639,51 @@ class Scheduler:
         time_now = 0.0
         self._compute_task_priorities(tasks, time_now)
 
-        # Step 4: 调度循环（与之前相同）
+        # Step 4: 调度循环（基于 P 优先，平手时按 EFT/比特数/轮转 规则）
         time_now = 0.0
         schedule_log = []
         remaining = set(tasks)
+        # 轮转防饥饿：记录每个电路最近被选择的事件序号，越小代表越久未被选择
+        event_index = 0
+        last_pick_index_by_circuit = {}
         while remaining:
-            ready_list = sorted(list(remaining), key=lambda t: getattr(t, 'priority', 0.0), reverse=True)
+            ready_list = list(remaining)
             if not ready_list:
                 break
-            selected = None
-            for cand in ready_list:
-                if self._can_execute_task(cand, time_now):
-                    selected = cand
-                    break
-            if selected is not None:
-                start, end = self._execute_task(selected, time_now)
-                schedule_log.append({'event': 'run', 'task': selected, 'start': start, 'end': end})
-                time_now = max(time_now, end)
-                remaining.remove(selected)
+
+            # 先找出最大优先级 P 的候选集合
+            max_priority = max(getattr(t, 'priority', 0.0) for t in ready_list)
+            if max_priority == 0.0:
+                # 没有可执行任务
+                # 推进时间到下一个节点
+                time_now = self._next_resource_release_time(self.qpus[0], time_now)
                 self._update_all_priorities(remaining, time_now)
                 continue
+            cand_list = [t for t in ready_list if getattr(t, 'priority', 0.0) == max_priority]
+            # 平手规则：EFT 更小优先；若仍并列，qubits 更大优先；若仍并列，按轮转（最近最少被选）
+            eft_map = self._compute_earliest_finish_times(cand_list, time_now)
+            def tie_key(t):
+                eft = eft_map.get(t, float('inf'))
+                qubits = getattr(getattr(t, 'circuit', None), 'num_qubits', 0)
+                circuit = getattr(t, 'parent', None)
+                last_idx = last_pick_index_by_circuit.get(circuit, -1)
+                return (eft, -qubits, last_idx)
 
-            switched = False
-            if random.random() < prob_switch:
-                top_task = ready_list[0]
-                owner_circuit = self._owner_circuit_of_task(top_task)
-                meta = chosen_plan_per_circuit.get(owner_circuit)
-                if meta and len(meta['all_plans']) > 1:
-                    alt = meta['all_plans'][1]
-                    old_tasks = set(meta['best_plan'])
-                    remaining -= old_tasks
-                    for t in alt:
-                        remaining.add(t)
-                    meta['all_plans'] = meta['all_plans'][1:] + meta['all_plans'][:1]
-                    meta['best_plan'] = alt
-                    self._compute_task_priorities(list(remaining), time_now)
-                    switched = True
-                    schedule_log.append({'event': 'switch_plan', 'circuit': owner_circuit})
+            selected = min(cand_list, key=tie_key)
 
-            if not switched:
-                dt = self._next_resource_release_time(qpu1, time_now)  # 简化：使用第一个QPU
-                time_now += dt
-                schedule_log.append({'event': 'wait', 'until': time_now})
-                self._update_all_priorities(remaining, time_now)
+            # 放置于 Chip*(task, t)：按最小 EFT 的设备进行放置，位置为“最早可行开始时刻”
+            start, end = self._execute_task(selected, time_now)
+            schedule_log.append({'event': 'run', 'task': selected, 'start': start, 'end': end})
+
+            # 时间推进到放置事件时刻（事件驱动：放置/完成后更新）
+            # time_now = max(time_now, start)
+            owner_circuit = getattr(selected, 'parent', None)
+            last_pick_index_by_circuit[owner_circuit] = event_index
+            event_index += 1
+
+            # 从就绪集中移除已完成任务，更新优先级（事件驱动）
+            remaining.remove(selected)
+            self._update_all_priorities(remaining, time_now)
 
         return schedule_log
 
@@ -711,6 +725,11 @@ class Scheduler:
         gamma = 0.5   # 装载友好性权重
         lambda_param = 0.5  # 解锁紧迫度调制参数
         
+                # 线性归一化：1 - norm(EFT)，越小越好
+        eft_values = [v for v in eft_dict.values() if v != float('inf')]
+        if eft_values:
+            min_eft, max_eft = min(eft_values), max(eft_values)
+
         for t in tasks:
             # 1. 解锁经典资源的紧迫程度
             circuit = getattr(t, 'parent', None)
@@ -728,18 +747,27 @@ class Scheduler:
             # 2. 尽早完工能力（归一化）
             eft = eft_dict.get(t, float('inf'))
             if eft == float('inf'):
-                early_finish = 0.0
+                t.priority = 0
+                continue
+            if max_eft > min_eft:
+                early_finish = 1.0 - (eft - min_eft) / (max_eft - min_eft)
             else:
-                # 线性归一化：1 - norm(EFT)，越小越好
-                eft_values = [v for v in eft_dict.values() if v != float('inf')]
-                if eft_values:
-                    min_eft, max_eft = min(eft_values), max(eft_values)
-                    if max_eft > min_eft:
-                        early_finish = 1.0 - (eft - min_eft) / (max_eft - min_eft)
-                    else:
-                        early_finish = 1.0
-                else:
-                    early_finish = 0.0
+                early_finish = 1.0
+            # if eft == float('inf'):
+            #     early_finish = 0.0
+            # else:
+            #     # 线性归一化：1 - norm(EFT)，越小越好
+            #     eft_values = [v for v in eft_dict.values() if v != float('inf')]
+            #     if eft_values:
+            #         min_eft, max_eft = min(eft_values), max(eft_values)
+            #         # if min_eft == float('inf'):
+            #         #     t.priority = 0
+            #         if max_eft > min_eft:
+            #             early_finish = 1.0 - (eft - min_eft) / (max_eft - min_eft)
+            #         else:
+            #             early_finish = 1.0
+            #     else:
+            #         early_finish = 0.0
             
             # 3. 装载友好性（归一化）
             load_score = load_friendliness.get(t, 0.0)
@@ -783,7 +811,7 @@ class Scheduler:
         
         for task in tasks:
             min_eft = float('inf')
-            
+            flag_current_executable = False
             # 遍历所有设备，找到最早完工时间
             for qpu in self.qpus:
                 # 使用QPU的calculate_execution_times方法（不实际分配资源）
@@ -791,9 +819,14 @@ class Scheduler:
                     task.circuit, 
                     time_now
                 )
+                if start_time > time_now:
+                    continue
+                flag_current_executable = True
                 eft = start_time + duration
                 min_eft = min(min_eft, eft)
-            
+            # if min_eft == float('inf'):
+            #     eft_dict[task] = float('inf')
+            #     break
             eft_dict[task] = min_eft
         
         return eft_dict
@@ -866,17 +899,19 @@ class Scheduler:
         # 找到最适合的设备
         best_qpu = None
         best_start_time = float('inf')
+        best_eft = float('inf')
         
         for qpu in self.qpus:
-            if self._can_execute_task(task, time_now):
-                est = self._compute_earliest_start_time(task, qpu, time_now)
-                if est < best_start_time:
-                    best_start_time = est
-                    best_qpu = qpu
-        
-        if best_qpu is None:
-            # 没有可用设备，延迟执行
-            return time_now, time_now + 1.0
+            # 逐设备评估最早开始与完工时间
+            start_time, duration = qpu.calculate_execution_times(
+                task.circuit,
+                time_now
+            )
+            eft = start_time + duration
+            if eft < best_eft or (math.isfinite(eft) and not math.isfinite(best_eft)):
+                best_eft = eft
+                best_start_time = start_time
+                best_qpu = qpu
         
         # 使用QPU的schedule_circuit方法
         start_time, duration = best_qpu.schedule_circuit(
@@ -889,7 +924,7 @@ class Scheduler:
         task.start_time = start_time
         task.end_time = end_time
         task.assigned_qpu = best_qpu
-        
+        self.executed_tasks.append(task)
         return start_time, end_time
 
     def _update_all_priorities(self, tasks: set[Task], time_now: float):
@@ -902,8 +937,6 @@ class Scheduler:
         """获取下一个资源释放时间"""
         # 找到下一个任务结束时间
         next_release = float('inf')
-        for start, end, _, _ in qpu.allocations:
-            if end > current_time:
-                next_release = min(next_release, end)
-        
-        return next_release if next_release != float('inf') else current_time + 1.0 
+        for task in self.executed_tasks:
+            next_release = min(next_release, task.end_time)
+        return next_release
