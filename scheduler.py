@@ -1,19 +1,32 @@
 import os
 import numpy as np
-from quantumcircuit.circuit import QuantumCircuit
-from performanceAccessing import compute_fidelity_requirement
+from CircuitCutting.performanceAccessing import compute_fidelity_requirement
 import random
-# 依赖：用于子线路在芯片上估计“最佳保真度”
-from performanceAccessing import estimate_best_fidelity_and_logical_stats
+# 依赖：用于子线路在芯片上估计"最佳保真度"
+from CircuitCutting.performanceAccessing import estimate_best_fidelity_and_logical_stats
+from CircuitCutting.performanceAccessing import estimate_partition_budgets, _backend_from_name
 import math
+from qiskit import QuantumCircuit
+from CircuitCutting.iterationCircuitCut import compute_subcircuits_with_budget
 
-class QPU
+# 宏定义：shots分配的基数
+SHOTS_SCALE_BASE = 4.0
+
+# 宏定义：单位执行时间（基于3.4GHz时钟频率）
+UNIT_EXECUTION_TIME = 1.0 / 3.4e9  # 秒
+
+class QPU():
+    pass
 #一个subcircuit为一个task
 class Task:
-    def __init__(self, subcircuit):
+    def __init__(self, subcircuit, parent=None):
         self.circuit = subcircuit
-        self.fidelity = None
+        self.estimated_fidelity = None #估计的保真度
+        self.estimated_seconds = None  #估计的执行时间(s)
+        self.executed_fidelity = None  #执行后的保真度（若有）
+        self.parent = parent #父节点
         self.poriority = 0.0
+        self.shots = 1.0
    
     def allocation(self, qpu:QPU, region, start_time, duration):
         self.start_time = start_time
@@ -26,36 +39,112 @@ class Task:
     
     def set_priority(self, priority):
         self.priority = priority
-    def get_fidelity(self):
-        if self.fidelity is None:
-            #todo 计算保真度
-            pass
-            
-        return self.fidelity
+    
+    def get_estimated_fidelity(self):
+        # 返回估计的保真度
+        return self.estimated_fidelity
+     
+    def get_executed_fidelity(self):
+        # 返回实际执行的保真度
+        return self.executed_fidelity
+
 
 class Circuit:
     def __init__(self, qasmfile):
         self.name = os.path.basename(qasmfile)
-        self.qc = QuantumCircuit(qasmfile)
-        self.classical_cost = 0
+        self.qc = QuantumCircuit.from_qasm_file(qasmfile)
+        self.qasmfile = qasmfile
+        self.classical_cost_time = 0
+        self.classical_cost_space = 0
         #多个分割方案 [tasks1,tasks2,...] tasks = list of Task
         self.partitions = []
         self.budgets = [] #每种分割方案的花费的预算
-        self.selected_partition = None
+        self.kept_partition = None # 保留的分割方案
+        self.selected_partition = None # 选择的分割方案
         self.required_fidelity = compute_fidelity_requirement(self.qc)
         self.fidelity = None
+    
     def cut(self, chips:list):
-        #切割线路
-        results = [] #todo: 调用切割算法
-        for res in results:
+        # 使用self.budgets中提供的多个预算，分别执行切割并生成多套子线路方案
+        # 若未预先计算预算，则先计算
+        if not getattr(self, 'budgets', None):
+            try:
+                self.compute_budget()
+            except Exception:
+                return
+        budgets_list = list(self.budgets) if isinstance(self.budgets, (list, tuple)) else [self.budgets]
+        # 清空旧方案与本次各方案的实际花费
+        self.partitions = []
+        self.partition_budgets = []
+
+        # 读取原始电路（Qiskit对象）
+        try:
+            qiskit_circuit = QuantumCircuit.from_qasm_file(self.qasmfile)
+        except Exception:
+            return
+
+        # 设备单次可用比特数上限：取可用QPU中的最大可用比特
+        try:
+            device_qubit_max = max(getattr(chip, 'num_qubits', 0) for chip in chips) if chips else qiskit_circuit.num_qubits
+            if not device_qubit_max or device_qubit_max <= 0:
+                device_qubit_max = qiskit_circuit.num_qubits
+        except Exception:
+            device_qubit_max = qiskit_circuit.num_qubits
+
+        for budget in budgets_list:
+            try:
+                res = compute_subcircuits_with_budget(
+                    circuit=qiskit_circuit,
+                    budget=int(budget),
+                    device_qubit_max=device_qubit_max,
+                    chip_name=None,              # 如需交换优化与保真度评估，可传入实际芯片名
+                    two_q_gate_name='cx',
+                    max_regions=200,
+                    excluded_qubits=None
+                )
+            except Exception:
+                continue
+
+            if not isinstance(res, dict) or res.get('status') != 'ok':
+                continue
+
+            subcircuits = res.get('subcircuits', []) or []
+            membership = res.get('membership', []) or []
+            per_counts = res.get('per_subcircuit_cut_counts', {}) or {}
+            total_cuts = int(res.get('cuts', 0) or 0)
+
+            # shots分配：按"子线路与其他子线路之间割数目"的归一化结果 * 4^(分割数目/2)
+            groups = sorted(set(m for m in membership if m != -1))
+            sum_counts = float(sum(per_counts.get(g, 0) for g in groups))
+            scale = SHOTS_SCALE_BASE ** (total_cuts / 2)
+
             partition = []
-            for subcircuit in res['subcircuits']:
-                task = Task(subcircuit)
+            k = len(subcircuits) if subcircuits else 1
+            for idx, sc in enumerate(subcircuits):
+                g = groups[idx] if idx < len(groups) else idx
+                cnt = float(per_counts.get(g, 0))
+                if sum_counts > 0:
+                    norm = cnt / sum_counts
+                else:
+                    norm = 1.0 / float(k)
+                shots = norm * scale
+                task = Task(sc, self)
+                task.shots = shots
                 partition.append(task)
+
             self.partitions.append(partition)
-            self.budgets.append(res['budget'])
-        #todo
-        self.classical_cost = 0
+            # 记录该方案的实际花费预算（used_budget），若不可用则回退为输入budget
+            used_b = res.get('used_budget', None)
+            try:
+                used_b = int(used_b) if used_b is not None else int(budget)
+            except Exception:
+                used_b = int(budget) if isinstance(budget, (int, float)) else 0
+            self.partition_budgets.append(used_b)
+        # 方案生成完成
+        # classical_cost分为时间和空间两个部分
+        total_shots = sum(sum(task.shots for task in partition) for partition in self.partitions)
+        self.classical_cost_time = total_shots * UNIT_EXECUTION_TIME
+        self.classical_cost_space = total_shots
     
     def finish_time(self):
         #返回线路完成时间
@@ -67,19 +156,302 @@ class Circuit:
             pass
         return self.fidelity
     
-
     def compute_budget(self):
-        #todo 计算线路的预算
-        self.budget = 0
+        # 调用 estimate_partition_budgets 估计三档预算，并设置默认预算为中档(M)
+        try:
+            qc_qiskit = QuantumCircuit.from_qasm_file(self.qasmfile)
+        except Exception:
+            # 无法读取则设为0
+            self.budget = 0
+            return
+        # 估计设备规模（缺少QPU上下文时用线路比特数回退）
+        try:
+            device_qubit_max = getattr(qc_qiskit, 'num_qubits', 0) or 0
+            if device_qubit_max <= 0:
+                device_qubit_max = self.qc.num_qubits
+        except Exception:
+            device_qubit_max = self.qc.num_qubits
+
+        res = estimate_partition_budgets(
+            qc_qiskit,
+            device_qubit_max=device_qubit_max,
+            B0=1.0, alpha=1.0, beta=1.0, eta=1.0,
+            gammas=(0.5, 1.0, 2.0),
+            required_fidelity=None,
+            ratio_req_over_est=1.1,
+        )
+        try:
+            budgets_int = res.get('budgets_int', {})
+            # 采用中档预算作为默认
+            # self.budget = int(budgets_int.get('M', 0) or 0)
+            # 保存多档预算到 circuits：确保为去重、去零的有序列表 [L, M, H]
+            cand_list = [int(budgets_int.get('L', 0) or 0), int(budgets_int.get('M', 0) or 0), int(budgets_int.get('H', 0) or 0)]
+            cand_list = [b for b in cand_list if b > 0]
+            # 去重并按升序排序
+            cand_list = sorted(list(dict.fromkeys(cand_list)))
+            self.budgets = cand_list
+            # 保留原始候选映射与详细信息
+            # self.budget_candidates = budgets_int
+            # 可选：保存细节供上层查看
+            # self.budget_detail = res
+        except Exception:
+            self.budgets = None
         
 
 class QPU:
     def __init__(self, backend):
-        self.backend = backend
-        self.num_qubits = backend.num_qubits
+        self.backend = _backend_from_name(backend)
+        self.num_qubits = self.backend.num_qubits
         self.qubit_busy_time = []
-    def add_task(self, task:Task):
+        # 设备时间线管理 - 改为记录具体的量子比特分配
+        self.allocations = []  # [(start_time, end_time, circuit, qubits_used), ...]
+        self.backend_name = backend
+        self.current_time = 0.0
+        # 量子比特连通性信息
+        self.connectivity = self._get_device_connectivity()
+    
+    def _get_device_connectivity(self):
+        """获取设备的量子比特连通性"""
+        try:
+            # 尝试从backend获取连通性信息
+            if hasattr(self.backend, 'configuration'):
+                config = self.backend.configuration()
+                if hasattr(config, 'coupling_map'):
+                    return config.coupling_map
+        except:
+            pass
+        
+        # 默认连通性：相邻比特连通
+        connectivity = []
+        for i in range(self.num_qubits - 1):
+            connectivity.append([i, i + 1])
+            connectivity.append([i + 1, i])  # 双向连通
+        return connectivity
+    
+    def add_task(self, task: Task):
+        """添加任务到设备（已废弃，使用schedule_circuit替代）"""
         pass
+
+    def schedule_circuit(self, circuit, current_time: float = None) -> tuple[float, float]:
+        """
+        为量子线路计算最早开始时间和执行时间，并实际分配资源
+        输入：circuit (量子线路), current_time (当前时间)
+        输出：(earliest_start_time, execution_duration)
+        """
+        if current_time is None:
+            current_time = self.current_time
+        
+        required_qubits = circuit.num_qubits
+        
+        # 1. 计算最早开始时间
+        earliest_start = self._find_earliest_start_time(required_qubits, current_time)
+        
+        # 2. 使用performanceAccessing函数估算执行时间
+        try:
+            from CircuitCutting.performanceAccessing import estimate_best_fidelity_and_logical_stats
+            # 调用性能评估函数获取执行时间
+            fidelity_stats = estimate_best_fidelity_and_logical_stats(circuit, self.backend_name)
+            if fidelity_stats and 'best_seconds' in fidelity_stats:
+                estimated_seconds = fidelity_stats['best_seconds']
+            else:
+                # 如果无法获取，使用默认值
+                estimated_seconds = 1.0
+        except ImportError:
+            # 如果无法导入模块，使用默认值
+            estimated_seconds = 1.0
+        
+        # 3. 计算实际执行时间（考虑设备状态）
+        execution_duration = estimated_seconds
+        
+        # 4. 分配具体的量子比特
+        allocated_qubits = self._allocate_qubits(required_qubits, earliest_start)
+        
+        # 5. 更新设备时间线
+        end_time = earliest_start + execution_duration
+        allocation = (earliest_start, end_time, circuit, allocated_qubits)
+        self.allocations.append(allocation)
+        
+        # 6. 更新当前时间
+        self.current_time = max(self.current_time, end_time)
+        
+        return earliest_start, execution_duration
+    
+    def calculate_execution_times(self, circuit: QuantumCircuit, current_time: float) -> tuple[float, float]:
+        """
+        计算量子线路的最早开始时间和执行时间（不实际分配资源）
+        输入：circuit (量子线路), current_time (当前时间)
+        输出：(earliest_start_time, execution_duration)
+        """
+        required_qubits = circuit.num_qubits
+        
+        # 1. 计算最早开始时间
+        earliest_start = self._find_earliest_start_time(required_qubits, current_time)
+        
+        # 2. 使用performanceAccessing函数估算执行时间
+        try:
+            from CircuitCutting.performanceAccessing import estimate_best_fidelity_and_logical_stats
+            # 调用性能评估函数获取执行时间
+            #Todo 需要修改: 下面的估计需要考虑earliest_start时候的空闲区域
+            fidelity_stats = estimate_best_fidelity_and_logical_stats(circuit, self.backend_name)
+            if fidelity_stats and 'best_seconds' in fidelity_stats:
+                estimated_seconds = fidelity_stats['best_seconds']
+            else:
+                # 如果无法获取，使用默认值
+                estimated_seconds = float('inf')
+        except ImportError:
+            # 如果无法导入模块，使用默认值
+            estimated_seconds = 1.0
+        
+        # 3. 计算实际执行时间（考虑设备状态）
+        execution_duration = estimated_seconds
+        
+        return earliest_start, execution_duration
+    
+    def _find_earliest_start_time(self, required_qubits: int, current_time: float) -> float:
+        """找到满足容量约束的最早开始时间"""
+        # 按时间顺序检查所有时间点
+        check_times = [current_time]
+        
+        # 添加所有分配结束时间作为候选时间点
+        for start, end, _, _ in self.allocations:
+            if end > current_time:
+                check_times.append(end)
+        
+        # 排序并去重
+        check_times = sorted(set(check_times))
+        
+        # 找到第一个满足容量约束的时间点
+        for time_point in check_times:
+            if self._check_capacity_at_time(required_qubits, time_point):
+                return time_point
+        
+        # 如果没有找到，返回当前时间（假设设备总是可用）
+        return current_time
+    
+    def _check_capacity_at_time(self, required_qubits: int, time_point: float) -> bool:
+        """检查在指定时间点是否有足够的连通量子比特"""
+        # 获取当前被占用的量子比特
+        occupied_qubits = self._get_occupied_qubits_at_time(time_point)
+        
+        # 获取可用的量子比特
+        available_qubits = [i for i in range(self.num_qubits) if i not in occupied_qubits]
+        
+        # 检查是否有足够的连通量子比特
+        return self._check_connectivity_constraint(available_qubits, required_qubits)
+    
+    def _get_occupied_qubits_at_time(self, time_point: float) -> list:
+        """获取指定时间点被占用的量子比特列表"""
+        occupied = []
+        for start, end, _, qubits_used in self.allocations:
+            if start <= time_point < end:
+                occupied.extend(qubits_used)
+        return occupied
+    
+    def _check_connectivity_constraint(self, available_qubits: list, required_qubits: int) -> bool:
+        """检查是否有足够的连通量子比特"""
+        if len(available_qubits) < required_qubits:
+            return False
+        
+        # 检查连通性：找到最大的连通子集
+        max_connected = self._find_max_connected_subset(available_qubits)
+        return len(max_connected) >= required_qubits
+    
+    def _find_max_connected_subset(self, qubits: list) -> list:
+        """找到最大的连通量子比特子集"""
+        if not qubits:
+            return []
+        
+        # 使用BFS找到最大连通分量
+        visited = set()
+        max_connected = []
+        
+        for start_qubit in qubits:
+            if start_qubit in visited:
+                continue
+            
+            # BFS搜索连通分量
+            connected = []
+            queue = [start_qubit]
+            visited.add(start_qubit)
+            
+            while queue:
+                current = queue.pop(0)
+                connected.append(current)
+                
+                # 查找相邻的量子比特
+                for neighbor in self._get_neighbors(current):
+                    if neighbor in qubits and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            
+            if len(connected) > len(max_connected):
+                max_connected = connected
+        
+        return max_connected
+    
+    def _get_neighbors(self, qubit: int) -> list:
+        """获取指定量子比特的邻居"""
+        neighbors = []
+        for connection in self.connectivity:
+            if connection[0] == qubit:
+                neighbors.append(connection[1])
+        return neighbors
+    
+    def _allocate_qubits(self, required_qubits: int, start_time: float) -> list:
+        """分配具体的量子比特"""
+        # 获取可用的量子比特
+        occupied_qubits = self._get_occupied_qubits_at_time(start_time)
+        available_qubits = [i for i in range(self.num_qubits) if i not in occupied_qubits]
+        
+        # 找到最大的连通子集
+        connected_qubits = self._find_max_connected_subset(available_qubits)
+        
+        # 选择前required_qubits个量子比特
+        if len(connected_qubits) >= required_qubits:
+            return connected_qubits[:required_qubits]
+        else:
+            # 如果连通比特不够，选择任意可用的比特（简化处理）
+            return available_qubits[:required_qubits]
+    
+    # def _estimate_execution_duration(self, circuit, base_duration: float, start_time: float) -> float:
+    #     """根据设备状态估算执行时间"""
+    #     required_qubits = circuit.num_qubits
+        
+    #     # 计算设备利用率
+    #     utilization = self._get_utilization_at_time(start_time)
+        
+    #     # 检查连续量子比特可用性
+    #     contiguous_available = self._get_contiguous_available_qubits(start_time, required_qubits)
+        
+    #     # 根据设备状态调整执行时间
+    #     if contiguous_available >= required_qubits:
+    #         # 有足够的连续比特，执行时间接近基础时间
+    #         duration_factor = 1.0 + 0.1 * utilization
+    #     else:
+    #         # 需要重新映射或分片，执行时间显著增加
+    #         duration_factor = 1.5 + 0.3 * utilization
+        
+    #     return base_duration * duration_factor
+    
+    def _get_utilization_at_time(self, time_point: float) -> float:
+        """获取指定时间点的设备利用率"""
+        occupied = len(self._get_occupied_qubits_at_time(time_point))
+        return occupied / self.num_qubits
+    
+    def _get_contiguous_available_qubits(self, time_point: float, required_qubits: int) -> int:
+        """获取指定时间点的连续可用量子比特数（简化实现）"""
+        # 简化实现：返回总可用比特数
+        occupied = len(self._get_occupied_qubits_at_time(time_point))
+        return self.num_qubits - occupied
+    
+    def get_available_qubits_at_time(self, time_point: float) -> int:
+        """获取指定时间点的可用量子比特数"""
+        occupied = len(self._get_occupied_qubits_at_time(time_point))
+        return self.num_qubits - occupied
+    
+    def get_utilization_at_time(self, time_point: float) -> float:
+        """获取指定时间点的设备利用率"""
+        return self._get_utilization_at_time(time_point)
 
     def latest_free_time(self, region, duration):
         #返回机器在region上能开始执行任务的最早时间
@@ -87,14 +459,21 @@ class QPU:
 
     def end_time(self):
         #返回机器完成所有任务的时间
-        pass
+        return self.current_time
 
 
 class Scheduler:
-    def __init__(self, qpus:list[QPU], circuits:list):
-        self.qpus = qpus
-        self.circuits = circuits
+    """量子电路调度器"""
     
+    def __init__(self, qpus: list[QPU], circuits: list[Circuit]):
+        self.qpus = qpus
+        self.circuits: list[Circuit] = circuits
+        # 移除重复的设备状态跟踪，使用QPU类内置的时间线管理
+    
+    def add_circuit(self, circuit: Circuit):
+        """添加电路到调度器"""
+        self.circuits.append(circuit)
+
     def cut_circuits(self):
         for circuit in self.circuits:
             circuit.cut(self.qpus)
@@ -124,16 +503,17 @@ class Scheduler:
         avg_log = sum(math.log(v) for v in vals) / len(vals)
         return math.exp(avg_log)
 
-    def offline_schedule(self, chip_name: str, score_fn=None, prob_switch: float = 0.2):
+    def offline_schedule(self, chip_name: str, score_fn=None, prob_switch: float = 0.2, weights: tuple | None = None):
         """
-        离线调度框架（加入更严格的第一轮筛选逻辑）:
-        1) 保真度过滤：仅保留满足 F_min^i 的方案。方案保真度估计为“该方案所有子线路在芯片上执行的最佳保真度”的重构保真度（几何均值，alpha_k=1/K）；若某线路无任何可行方案，则直接返回不可执行。
-        2) 对剩余方案评分（保留全部），但为每条线路挑选评分最高的方案进入初始tasks队列；
+        离线调度框架（加入更严格的第一轮筛选逻辑):
+        1) 保真度过滤：仅保留满足 F_min^i 的方案。方案保真度估计为"该方案所有子线路在芯片上执行的最佳保真度"的重构保真度（几何均值，alpha_k=1/K）；若某线路无任何可行方案，则直接返回不可执行。
+        2) 对剩余方案按 S = w1*max_qubits + w2*sum_seconds + w3*classical_time 评分（越小越好），为每条线路挑选S最小的方案进入初始tasks队列；
         3) 为tasks计算初始优先级；
         4) 迭代调度（与先前相同）。
         """
         # 预处理：评分函数
         score = score_fn if score_fn is not None else self._score_plan
+        w1, w2, w3 = (weights if (isinstance(weights, (list, tuple)) and len(weights) == 3) else (3.0, 2.0, 1.0))
 
         # Step 1: 方案按 F_min 阈值过滤（方案保真度=子线路最佳保真度的重构值）
         circuit_to_filtered_plans = {}
@@ -157,17 +537,19 @@ class Scheduler:
 
             kept = []
             for plan in plans:
-                # 逐子线路估计最佳保真度
+                # 逐子线路估计最佳保真度与时间
                 best_fids = []
                 for task in plan:
-                    if getattr(task, 'fidelity', None) is None:
+                    if getattr(task, 'estimated_fidelity', None) is None or getattr(task, 'estimated_seconds', None) is None:
                         try:
                             est = estimate_best_fidelity_and_logical_stats(task.circuit, chip_name)
-                            task.fidelity = est['best_fidelity'] if est and 'best_fidelity' in est else None
+                            task.estimated_fidelity = est['best_fidelity'] if est and 'best_fidelity' in est else None
+                            task.estimated_seconds = est['best_seconds'] if est and 'best_seconds' in est else None
                         except Exception:
-                            task.fidelity = None
-                    if task.fidelity is not None:
-                        best_fids.append(float(task.fidelity))
+                            task.estimated_fidelity = None
+                            task.estimated_seconds = None
+                    if task.estimated_fidelity is not None:
+                        best_fids.append(float(task.estimated_fidelity))
                 # 方案保真度：几何均值重构
                 plan_fid = self._reconstruct_fidelity_geom(best_fids)
                 if plan_fid is None:
@@ -175,6 +557,7 @@ class Scheduler:
                 if plan_fid >= thr:
                     kept.append(plan)
             circuit_to_filtered_plans[c] = kept
+            c.kept_partition = kept
             if not kept:
                 any_infeasible = True
                 infeasible_circuit = c
@@ -187,13 +570,47 @@ class Scheduler:
                 'circuit': getattr(infeasible_circuit, 'name', None)
             }
 
-        # Step 2: 评分与初选方案
+        # Step 2: 评分与初选方案（S最小）
         chosen_plan_per_circuit = {}
         for c, kept in circuit_to_filtered_plans.items():
             if not kept:
                 continue
-            scored = [(score(c, plan), plan) for plan in kept]
-            scored.sort(key=lambda x: x[0], reverse=True)
+            def plan_cost_S(plan):
+                # 最大子线路qubits
+                max_qubits = 0
+                sum_seconds = 0.0
+                classical_time = 0.0
+                for t in plan:
+                    try:
+                        qn = int(getattr(t.circuit, 'num_qubits', 0))
+                    except Exception:
+                        qn = 0
+                    if qn > max_qubits:
+                        max_qubits = qn
+                    # seconds
+                    sec = getattr(t, 'estimated_seconds', None)
+                    if sec is None:
+                        try:
+                            est = estimate_best_fidelity_and_logical_stats(t.circuit, chip_name)
+                            sec = est['best_seconds'] if est and 'best_seconds' in est else 0.0
+                            t.estimated_seconds = sec
+                        except Exception:
+                            sec = 0.0
+                    try:
+                        sum_seconds += float(sec or 0.0)
+                    except Exception:
+                        pass
+                    # classical time proxy: use shots
+                    try:
+                        classical_time += float(getattr(t, 'shots', 0.0) or 0.0) * UNIT_EXECUTION_TIME
+                    except Exception:
+                        pass
+                # S作为该线路需要的全部执行时间
+                total_execution_time = (w1 * float(max_qubits)) + (w2 * float(sum_seconds)) + (w3 * float(classical_time))
+                return total_execution_time
+
+            scored = [(plan_cost_S(plan), plan) for plan in kept]
+            scored.sort(key=lambda x: x[0])  # 越小越好
             chosen_plan_per_circuit[c] = {
                 'all_plans': [p for _, p in scored],
                 'best_plan': scored[0][1],
@@ -207,7 +624,8 @@ class Scheduler:
             tasks.extend(best)
 
         # Step 3: 计算每个task的优先级
-        self._compute_task_priorities(tasks)
+        time_now = 0.0
+        self._compute_task_priorities(tasks, time_now)
 
         # Step 4: 调度循环（与之前相同）
         time_now = 0.0
@@ -243,12 +661,12 @@ class Scheduler:
                         remaining.add(t)
                     meta['all_plans'] = meta['all_plans'][1:] + meta['all_plans'][:1]
                     meta['best_plan'] = alt
-                    self._compute_task_priorities(list(remaining))
+                    self._compute_task_priorities(list(remaining), time_now)
                     switched = True
                     schedule_log.append({'event': 'switch_plan', 'circuit': owner_circuit})
 
             if not switched:
-                dt = self._next_resource_release_time(time_now)
+                dt = self._next_resource_release_time(qpu1, time_now)  # 简化：使用第一个QPU
                 time_now += dt
                 schedule_log.append({'event': 'wait', 'until': time_now})
                 self._update_all_priorities(remaining, time_now)
@@ -260,48 +678,232 @@ class Scheduler:
         """方案评分函数（占位）：可结合保真度、时长、预算等多因素。
         默认：按任务数量的负数（越少越好）+ 任务保真度最小值加权。
         """
-        fids = [t.get_fidelity() for t in plan if t.get_fidelity() is not None]
+        fids = [t.get_estimated_fidelity() for t in plan if t.get_estimated_fidelity() is not None]
         min_fid = min(fids) if fids else 0.0
         return (min_fid) - 0.01 * len(plan)
 
-    def _compute_task_priorities(self, tasks: list[Task]):
-        """计算task优先级（占位）。可用关键路径、截止期、保真度提升潜力等。
-        默认：按保真度降序。
+    def _compute_task_priorities(self, tasks: list[Task], time_now: float = 0.0):
+        """计算task优先级（基于量子容量时间线的列表调度）
+        实现动态优先级构造，考虑：
+        1) 解锁经典资源的紧迫程度
+        2) 经典资源利用率调制
+        3) 尽早完工能力
+        4) 装载友好性
         """
+        # 计算经典资源利用率
+        classical_utilization = self._compute_classical_utilization(time_now)
+        modulation_factor = 1.0 - classical_utilization
+        
+        # 计算每个task所属circuit的剩余子线路数
+        circuit_remaining_tasks = self._compute_circuit_remaining_tasks(tasks, time_now)
+        
+        # 计算就绪任务的最早完工时间
+        eft_dict = self._compute_earliest_finish_times(tasks, time_now)
+        
+        # 计算装载友好性指标
+        # Todo 应该是当前所有设备中，空闲量子比特数目最大的区域，并考虑正在执行的任务的占据情况
+        max_device_qubits = max(qpu.num_qubits for qpu in self.qpus) if self.qpus else 1
+        load_friendliness = self._compute_load_friendliness(tasks, max_device_qubits)
+        
+        # 优先级参数设置
+        alpha = 10.0  # 解锁紧迫度权重（最高）
+        beta = 1.0    # 尽早完工权重
+        gamma = 0.5   # 装载友好性权重
+        lambda_param = 0.5  # 解锁紧迫度调制参数
+        
         for t in tasks:
-            fid = t.get_fidelity()
-            pr = fid if fid is not None else 0.0
-            # 也可加入更多因素
-            t.priority = pr
+            # 1. 解锁经典资源的紧迫程度
+            circuit = getattr(t, 'parent', None)
+            if circuit is None:
+                unlock_urgency = 0.0
+            else:
+                remaining_count = circuit_remaining_tasks.get(circuit, 0)
+                if remaining_count == 1:
+                    unlock_urgency = 1.0  # 只差最后一条子线路
+                elif remaining_count > 1:
+                    unlock_urgency = lambda_param / remaining_count
+                else:
+                    unlock_urgency = 0.0
+            
+            # 2. 尽早完工能力（归一化）
+            eft = eft_dict.get(t, float('inf'))
+            if eft == float('inf'):
+                early_finish = 0.0
+            else:
+                # 线性归一化：1 - norm(EFT)，越小越好
+                eft_values = [v for v in eft_dict.values() if v != float('inf')]
+                if eft_values:
+                    min_eft, max_eft = min(eft_values), max(eft_values)
+                    if max_eft > min_eft:
+                        early_finish = 1.0 - (eft - min_eft) / (max_eft - min_eft)
+                    else:
+                        early_finish = 1.0
+                else:
+                    early_finish = 0.0
+            
+            # 3. 装载友好性（归一化）
+            load_score = load_friendliness.get(t, 0.0)
+            
+            # 4. 综合优先级计算
+            priority = (alpha * modulation_factor * unlock_urgency + 
+                       beta * early_finish + 
+                       gamma * load_score)
+            
+            t.priority = priority
+
+    def _compute_classical_utilization(self, time_now: float) -> float:
+        """计算经典资源利用率 U_C(t)"""
+        total_classical_cost = 0.0
+        classical_resource_limit = 1000.0  # 可配置的经典资源限制
+        
+        # 统计当前正在执行的经典后处理任务
+        for circuit in self.circuits:
+            # 这里需要根据实际调度状态计算
+            # 简化实现：假设所有circuit的经典成本都在执行
+            if hasattr(circuit, 'classical_cost_space'):
+                total_classical_cost += circuit.classical_cost_space
+        
+        utilization = min(1.0, total_classical_cost / classical_resource_limit)
+        return utilization
+
+    def _compute_circuit_remaining_tasks(self, tasks: list[Task], time_now: float) -> dict:
+        """计算每个circuit的剩余未完成任务数 R_i(t)"""
+        circuit_remaining = {}
+        
+        for circuit in self.circuits:
+            # 统计该circuit的所有任务
+            circuit_tasks = [t for t in tasks if getattr(t, 'parent') == circuit]
+            circuit_remaining[circuit] = len(circuit_tasks)
+        
+        return circuit_remaining
+
+    def _compute_earliest_finish_times(self, tasks: list[Task], time_now: float) -> dict:
+        """计算每个任务的最早完工时间 EFT(subcircuit, t)"""
+        eft_dict = {}
+        
+        for task in tasks:
+            min_eft = float('inf')
+            
+            # 遍历所有设备，找到最早完工时间
+            for qpu in self.qpus:
+                # 使用QPU的calculate_execution_times方法（不实际分配资源）
+                start_time, duration = qpu.calculate_execution_times(
+                    task.circuit, 
+                    time_now
+                )
+                eft = start_time + duration
+                min_eft = min(min_eft, eft)
+            
+            eft_dict[task] = min_eft
+        
+        return eft_dict
+
+    def _compute_earliest_start_time(self, task: Task, qpu: QPU, time_now: float) -> float:
+        """计算任务在指定设备上的最早开始时间 EST(subcircuit, Chip_k, t)"""
+        # 使用QPU的calculate_execution_times方法
+        start_time, _ = qpu.calculate_execution_times(
+            task.circuit, 
+            time_now
+        )
+        return start_time
+
+    def _estimate_task_duration_on_device(self, task: Task, qpu: QPU, start_time: float) -> float:
+        """根据设备状态动态估算任务执行时间"""
+        # 使用QPU的方法计算执行时间
+        return qpu._estimate_execution_duration(task.circuit, task.estimated_seconds or 1.0, start_time)
+
+    def _get_device_timeline(self, qpu: QPU) -> dict:
+        """获取设备的容量时间线"""
+        # 返回QPU的时间线信息
+        return {
+            'num_qubits': qpu.num_qubits,
+            'allocations': qpu.allocations,
+            'current_time': qpu.current_time
+        }
+
+    def _check_capacity_constraint(self, qpu: QPU, start_time: float, required_qubits: int) -> bool:
+        """检查在指定时间点是否满足容量约束"""
+        return qpu._check_capacity_at_time(required_qubits, start_time)
+
+    def _get_available_qubits_at_time(self, qpu: QPU, time: float) -> int:
+        """获取指定时间点的可用量子比特数"""
+        return qpu.get_available_qubits_at_time(time)
+
+    def _get_occupied_qubits_at_time(self, qpu: QPU, time: float) -> int:
+        """获取指定时间点被占用的量子比特数"""
+        return len(qpu._get_occupied_qubits_at_time(time))
+
+    def _get_device_utilization(self, qpu: QPU, time: float) -> float:
+        """获取设备在指定时间点的利用率"""
+        return qpu.get_utilization_at_time(time)
+
+    def _get_contiguous_available_qubits(self, qpu: QPU, start_time: float, required_qubits: int) -> int:
+        """获取从指定时间开始的连续可用量子比特数"""
+        return qpu._get_contiguous_available_qubits(start_time, required_qubits)
+
+    def _compute_load_friendliness(self, tasks: list[Task], max_device_qubits: int) -> dict:
+        """计算装载友好性指标 K(subcircuit)"""
+        load_scores = {}
+        
+        for task in tasks:
+            task_qubits = task.circuit.num_qubits
+            # 归一化：task_qubits / max_device_qubits
+            load_score = task_qubits / max_device_qubits
+            load_scores[task] = load_score
+        
+        return load_scores
 
     def _can_execute_task(self, task: Task, time_now: float) -> bool:
-        """判断task在当前时刻是否可执行（占位）。
-        可检查QPU可用性、region冲突、依赖完成等。
-        """
-        return True  # 占位：默认可执行
+        """判断task在当前时刻是否可执行"""
+        # 检查是否有设备满足容量约束
+        for qpu in self.qpus:
+            if self._check_capacity_constraint(qpu, time_now, task.circuit.num_qubits):
+                return True
+        return False
 
     def _execute_task(self, task: Task, time_now: float) -> tuple[float, float]:
-        """执行task（占位）：分配QPU/region，返回(start, end)。"""
-        duration = getattr(task, 'duration', 1.0) or 1.0
-        start = time_now
-        end = start + duration
-        # TODO: 标记QPU资源占用
-        return start, end
+        """执行task：分配QPU，更新设备状态，返回(start, end)"""
+        # 找到最适合的设备
+        best_qpu = None
+        best_start_time = float('inf')
+        
+        for qpu in self.qpus:
+            if self._can_execute_task(task, time_now):
+                est = self._compute_earliest_start_time(task, qpu, time_now)
+                if est < best_start_time:
+                    best_start_time = est
+                    best_qpu = qpu
+        
+        if best_qpu is None:
+            # 没有可用设备，延迟执行
+            return time_now, time_now + 1.0
+        
+        # 使用QPU的schedule_circuit方法
+        start_time, duration = best_qpu.schedule_circuit(
+            task.circuit, 
+            time_now
+        )
+        end_time = start_time + duration
+        
+        # 更新任务状态
+        task.start_time = start_time
+        task.end_time = end_time
+        task.assigned_qpu = best_qpu
+        
+        return start_time, end_time
 
     def _update_all_priorities(self, tasks: set[Task], time_now: float):
-        """根据时间推进/资源变化更新优先级（占位）。"""
-        for t in tasks:
-            # 示例：随时间略微衰减，推动早调度
-            base = getattr(t, 'priority', 0.0)
-            t.priority = max(0.0, base * 0.999)
+        """根据时间推进/资源变化更新优先级"""
+        # 重新计算优先级，考虑当前时间状态
+        self._compute_task_priorities(list(tasks), time_now)
 
-    def _owner_circuit_of_task(self, task: Task) -> Circuit | None:
-        """返回该task所属的Circuit（占位）。若未维护映射，返回None。"""
-        return None
 
-    def _next_resource_release_time(self, time_now: float) -> float:
-        """计算距离下一次资源释放的时间间隔（占位）。"""
-        return 1.0
+    def _next_resource_release_time(self, qpu: QPU, current_time: float) -> float:
+        """获取下一个资源释放时间"""
+        # 找到下一个任务结束时间
+        next_release = float('inf')
+        for start, end, _, _ in qpu.allocations:
+            if end > current_time:
+                next_release = min(next_release, end)
         
-    
-    
+        return next_release if next_release != float('inf') else current_time + 1.0 

@@ -5,14 +5,12 @@ import os
 # from qiskit.providers.fake_provider import fake_provider
 from qiskit_ibm_runtime.fake_provider import FakeManilaV2, FakeGuadalupeV2, FakeHanoiV2, FakeMelbourneV2, FakeManhattanV2
 import math
-from iterationCircuitCut import read_circuit, compute_subcircuits_with_budget
+from .iterationCircuitCut import read_circuit, compute_subcircuits_with_budget
 
 # 固定随机种子，稳定SABRE与其他启发式行为
 SEED_TRANSPILE = 12345
 import os
 import numpy as np
-from quantumcircuit.circuit import QuantumCircuit
-
 # ------------------------
 # 宏：执行正确率（可根据需要调整）
 # ------------------------
@@ -713,7 +711,7 @@ def find_feasible_regions_for_circuit(circ, backend, two_q_gate_name='cx', max_r
     - excluded_qubits: 需要排除的物理比特ID集合/列表，这些比特不会出现在返回的区域中。
     返回: List[List[int]]（每个是物理比特列表）。
     """
-    k = circ.num_qubits
+    k = circ.qc.num_qubits
     edges = _get_coupling_edges(backend, two_q_gate_name=two_q_gate_name)
     if not edges:
         raise ValueError("未能从后端获取耦合边，无法搜索可行区域")
@@ -1117,7 +1115,7 @@ def _backend_from_name(chip_name: str):
         'FakeMelbourneV2': FakeMelbourneV2,
         'FakeManhattanV2': FakeManhattanV2,
     }
-    if name not in mapping:
+    if chip_name not in mapping:
         raise ValueError(f"不支持的芯片名称: {chip_name}")
     return mapping[name]()
 
@@ -1181,31 +1179,29 @@ def estimate_best_fidelity_and_logical_stats(circuit, chip_name: str, two_q_gate
     backend = _backend_from_name(chip_name)
 
     # 候选区域（连通、规模匹配），限制数量以提升速度
-    candidates = find_feasible_regions_for_circuit(
-        circuit,
-        backend,
-        two_q_gate_name=two_q_gate_name,
-        max_regions=max_regions,
-        excluded_qubits=excluded_qubits,
-    )
+    # candidates = find_feasible_regions_for_circuit(
+    #     circuit,
+    #     backend,
+    #     two_q_gate_name=two_q_gate_name,
+    #     max_regions=max_regions,
+    #     excluded_qubits=excluded_qubits,
+    # )
+    candidates = find_best_region_by_avg_performance(circuit, backend, two_q_gate_name=two_q_gate_name, max_regions=max_regions, excluded_qubits=excluded_qubits)
+
     if not candidates:
         return None
 
     best = None
-    for region in candidates:
-        try:
-            mapped = transpile_to_region(circuit, backend, region)
-            secs, fid = estimate_time_and_fidelity(mapped, backend)
-            item = {
-                'region': region,
-                'mapped': mapped,
-                'seconds': secs if secs is not None else float('inf'),
-                'fidelity': fid if fid is not None else 0.0,
-            }
-            if best is None or item['fidelity'] > best['fidelity']:
-                best = item
-        except Exception:
-            continue
+    mapped = transpile_to_region(circuit, backend, candidates['region'])
+    secs, fid = estimate_time_and_fidelity(mapped, backend)
+    item = {
+        'region': candidates['region'],
+        'mapped': mapped,
+        'seconds': secs if secs is not None else float('inf'),
+        'fidelity': fid if fid is not None else 0.0,
+    }
+    if best is None or item['fidelity'] > best['fidelity']:
+        best = item
 
     if best is None:
         return None
