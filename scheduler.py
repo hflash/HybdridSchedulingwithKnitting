@@ -515,7 +515,7 @@ class Scheduler:
         avg_log = sum(math.log(v) for v in vals) / len(vals)
         return math.exp(avg_log)
 
-    def offline_schedule(self, chip_name: str, score_fn=None, prob_switch: float = 0.2, weights: tuple | None = None):
+    def offline_schedule(self, score_fn=None, prob_switch: float = 0.2, weights: tuple | None = None):
         """
         离线调度框架（加入更严格的第一轮筛选逻辑):
         1) 保真度过滤：仅保留满足 F_min^i 的方案。方案保真度估计为"该方案所有子线路在芯片上执行的最佳保真度"的重构保真度（几何均值，alpha_k=1/K）；若某线路无任何可行方案，则直接返回不可执行。
@@ -553,13 +553,18 @@ class Scheduler:
                 best_fids = []
                 for task in plan:
                     if getattr(task, 'estimated_fidelity', None) is None or getattr(task, 'estimated_seconds', None) is None:
-                        try:
-                            est = estimate_best_fidelity_and_logical_stats(task.circuit, chip_name)
-                            task.estimated_fidelity = est['best_fidelity'] if est and 'best_fidelity' in est else None
-                            task.estimated_seconds = est['best_seconds'] if est and 'best_seconds' in est else None
-                        except Exception:
-                            task.estimated_fidelity = None
-                            task.estimated_seconds = None
+                        best_fid = 0
+                        best_seconds = float('inf')
+                        for qpu in self.qpus:
+                            try:
+                                est = estimate_best_fidelity_and_logical_stats(task.circuit, qpu.backend_name)
+                                best_fid = max(best_fid, est['best_fidelity']) if est and 'best_fidelity' in est else None
+                                best_seconds = min(best_seconds, est['best_seconds']) if est and 'best_seconds' in est else None
+                            except Exception:
+                                best_fid = None
+                                best_seconds = None
+                        task.estimated_fidelity = best_fid
+                        task.estimated_seconds = best_seconds
                     if task.estimated_fidelity is not None:
                         best_fids.append(float(task.estimated_fidelity))
                 # 方案保真度：几何均值重构
@@ -938,5 +943,6 @@ class Scheduler:
         # 找到下一个任务结束时间
         next_release = float('inf')
         for task in self.executed_tasks:
-            next_release = min(next_release, task.end_time)
+            if task.end_time > current_time:
+                next_release = min(next_release, task.end_time)
         return next_release
