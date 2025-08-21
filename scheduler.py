@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 from CircuitCutting.performanceAccessing import compute_fidelity_requirement
 import random
@@ -66,10 +67,23 @@ class Circuit:
         self.selected_partition = None # 选择的分割方案
         self.required_fidelity = compute_fidelity_requirement(self.qc)
         self.fidelity = None
+        self.partition_classical_cost_time = []
+        self.partition_classical_cost_space = []
     
     def cut(self, chips:list):
         # 使用self.budgets中提供的多个预算，分别执行切割并生成多套子线路方案
         # 若未预先计算预算，则先计算
+        # 如果该线路的比特数小于最小的量子设备的比特数目，则不进行切割
+        if self.qc.num_qubits <= min(getattr(chip, 'num_qubits', 0) for chip in chips):
+            self.partitions.append([Task(self.qc, self)])
+            self.budgets.append(0)
+            # self.partition_memberships.append([0] * self.qc.num_qubits)
+            self.partition_classical_cost_time.append(0)
+            self.partition_classical_cost_space.append(0)
+            self.classical_cost_time = 0.0
+            self.classical_cost_space = 0.0
+            return
+        
         if not getattr(self, 'budgets', None):
             try:
                 self.compute_budget()
@@ -79,15 +93,13 @@ class Circuit:
         # 清空旧方案与本次各方案的实际花费
         self.partitions = []
         self.partition_budgets = []
+        self.partition_memberships = []
         # 按方案记录经典代价（时间/空间）
         self.partition_classical_cost_time = []
         self.partition_classical_cost_space = []
 
         # 读取原始电路（Qiskit对象）
-        try:
-            qiskit_circuit = QuantumCircuit.from_qasm_file(self.qasmfile)
-        except Exception:
-            return
+        qiskit_circuit = self.qc
 
         # 设备单次可用比特数上限：取可用QPU中的最大可用比特
         try:
@@ -146,6 +158,11 @@ class Circuit:
             except Exception:
                 used_b = int(budget) if isinstance(budget, (int, float)) else 0
             self.partition_budgets.append(used_b)
+            # 保存该方案的 membership
+            try:
+                self.partition_memberships.append(list(membership) if membership is not None else [])
+            except Exception:
+                self.partition_memberships.append([])
             # 记录该方案的经典代价：shots 之和作为空间，乘以单位时间作为时间
             try:
                 part_shots = float(sum(getattr(t, 'shots', 0.0) or 0.0 for t in partition))
@@ -513,6 +530,83 @@ class Scheduler:
         for circuit in self.circuits:
             circuit.cut(self.qpus)
 
+    # ----------------- 切割结果的保存与加载 -----------------
+    def save_cuts(self, target_path: str):
+        """将当前 circuits 的切割结果保存到 JSON 文件。
+        内容：每条线路的名称、路径、各预算、membership（分割成员关系，来自 cut 过程）。
+        { circuits: [ { name, qasmfile, budgets: [..], partitions: [ {budget, membership} ] } ] }
+        """
+        data = { 'circuits': [] }
+        for c in self.circuits:
+            entry = {
+                'name': getattr(c, 'name', None),
+                'qasmfile': getattr(c, 'qasmfile', None),
+                'budgets': list(getattr(c, 'budgets', []) or []),
+                'partitions': []
+            }
+            memberships = getattr(c, 'partition_memberships', []) or []
+            budgets = getattr(c, 'partition_budgets', []) or []
+            for i in range(max(len(memberships), len(budgets))):
+                entry['partitions'].append({
+                    'budget': budgets[i] if i < len(budgets) else None,
+                    'membership': memberships[i] if i < len(memberships) else []
+                })
+            data['circuits'].append(entry)
+        with open(target_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load_cuts(self, source_path: str):
+        """从 JSON 文件加载切割结果：创建/更新 circuits 列表，并按 membership 重建 partitions。
+        要求 JSON 结构与 save_cuts 一致。
+        - 对每条线路：读取 qasmfile，构建 Circuit；设置 budgets 与 partition_budgets；
+          根据 membership 将原始电路按成员关系拆分成子线路 Task，写入 circuit.partitions。
+        注意：此处 membership 的重建需要依赖 iterationCircuitCut 的接口；如果不存在，则退化为占位子电路。
+        """
+        if not os.path.exists(source_path):
+            raise FileNotFoundError(source_path)
+        with open(source_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        circuits_meta = data.get('circuits', []) or []
+        loaded = []
+        for meta in circuits_meta:
+            qasmfile = meta.get('qasmfile')
+            try:
+                circuit = Circuit(qasmfile)
+            except Exception:
+                # 无法加载 qasm，则跳过
+                continue
+            # budgets/partition_budgets
+            circuit.budgets = list(meta.get('budgets', []) or [])
+            parts_meta = meta.get('partitions', []) or []
+            circuit.partition_budgets = [p.get('budget') for p in parts_meta]
+            circuit.partitions = []
+            circuit.partition_memberships = []
+            # 依据 membership 重建子线路（若无法真实重建，则直接占位）
+            try:
+                from CircuitCutting.iterationCircuitCut import rebuild_subcircuits_from_membership
+            except Exception:
+                rebuild_subcircuits_from_membership = None
+            for p in parts_meta:
+                membership = p.get('membership') or []
+                subcircuits = []
+                if rebuild_subcircuits_from_membership is not None:
+                    try:
+                        subcircuits = rebuild_subcircuits_from_membership(
+                            QuantumCircuit.from_qasm_file(qasmfile), membership
+                        )
+                    except Exception:
+                        subcircuits = []
+                # 回退：若无法重建，则至少创建空占位 task 数组以保持结构
+                tasks = []
+                if subcircuits:
+                    for sc in subcircuits:
+                        tasks.append(Task(sc, circuit))
+                circuit.partitions.append(tasks)
+                circuit.partition_memberships.append(list(membership))
+            loaded.append(circuit)
+        # 覆盖调度器的电路集
+        self.circuits = loaded
+
 
     def schedule(self):
         self.cut_circuits()
@@ -574,6 +668,10 @@ class Scheduler:
             for plan in plans:
                 # 逐子线路估计最佳保真度与时间
                 best_fids = []
+                if len(plan) == 1:
+                    if plan[0].circuit.num_qubits <= min(getattr(chip, 'num_qubits', 0) for chip in self.qpus):
+                        kept.append(plan)
+                        continue
                 for task in plan:
                     if getattr(task, 'estimated_fidelity', None) is None or getattr(task, 'estimated_seconds', None) is None:
                         best_fid = 0
@@ -721,6 +819,7 @@ class Scheduler:
                 if time_now == float('inf'):
                     print("没有可执行任务")
                     break
+                self._schedule_ready_classical_jobs(time_now, schedule_log)
                 self._update_all_priorities(remaining, time_now)
                 continue
             cand_list = [t for t in ready_list if getattr(t, 'priority', 0.0) == max_priority]
