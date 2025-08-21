@@ -13,6 +13,8 @@ from CircuitCutting.iterationCircuitCut import compute_subcircuits_with_budget
 # 宏定义：shots分配的基数
 SHOTS_SCALE_BASE = 4.0
 
+SHOTS_BASE = 1024.0
+
 # 宏定义：预算的最大值；经典资源上限 = 4^BUDGET_MAX
 BUDGET_MAX = 10
 
@@ -69,13 +71,19 @@ class Circuit:
         self.fidelity = None
         self.partition_classical_cost_time = []
         self.partition_classical_cost_space = []
+        # 额外保存每个方案的 cuts 与 per_counts 以便重建 shots
+        self.partition_cuts = []
+        self.partition_per_counts = []
+        self.arrival_time = 0.0
     
     def cut(self, chips:list):
         # 使用self.budgets中提供的多个预算，分别执行切割并生成多套子线路方案
         # 若未预先计算预算，则先计算
         # 如果该线路的比特数小于最小的量子设备的比特数目，则不进行切割
         if self.qc.num_qubits <= min(getattr(chip, 'num_qubits', 0) for chip in chips):
-            self.partitions.append([Task(self.qc, self)])
+            t = Task(self.qc, self)
+            t.shots = 1.0
+            self.partitions.append([t])
             self.budgets.append(0)
             # self.partition_memberships.append([0] * self.qc.num_qubits)
             self.partition_classical_cost_time.append(0)
@@ -94,6 +102,8 @@ class Circuit:
         self.partitions = []
         self.partition_budgets = []
         self.partition_memberships = []
+        self.partition_cuts = []
+        self.partition_per_counts = []
         # 按方案记录经典代价（时间/空间）
         self.partition_classical_cost_time = []
         self.partition_classical_cost_space = []
@@ -146,6 +156,10 @@ class Circuit:
                 else:
                     norm = 1.0 / float(k)
                 shots = norm * scale
+                if shots == 0:
+                    shots = SHOTS_BASE
+                else:
+                    shots = norm * scale * SHOTS_BASE
                 task = Task(sc, self)
                 task.shots = shots
                 partition.append(task)
@@ -159,15 +173,12 @@ class Circuit:
                 used_b = int(budget) if isinstance(budget, (int, float)) else 0
             self.partition_budgets.append(used_b)
             # 保存该方案的 membership
-            try:
-                self.partition_memberships.append(list(membership) if membership is not None else [])
-            except Exception:
-                self.partition_memberships.append([])
+            self.partition_memberships.append(list(membership) if membership is not None else [])
+            # 保存该方案的切割统计
+            self.partition_cuts.append(int(total_cuts))
+            self.partition_per_counts.append(dict(per_counts))
             # 记录该方案的经典代价：shots 之和作为空间，乘以单位时间作为时间
-            try:
-                part_shots = float(sum(getattr(t, 'shots', 0.0) or 0.0 for t in partition))
-            except Exception:
-                part_shots = 0.0
+            part_shots = float(sum(getattr(t, 'shots', 0.0) or 0.0 for t in partition))
             self.partition_classical_cost_space.append(part_shots)
             self.partition_classical_cost_time.append(part_shots * UNIT_EXECUTION_TIME)
         # 方案生成完成
@@ -181,7 +192,7 @@ class Circuit:
 
     def get_fidelity(self):
         if self.fidelity is None:
-            #todo 计算保真度
+            #计算保真度
             pass
         return self.fidelity
 
@@ -265,7 +276,7 @@ class QPU:
         """添加任务到设备（已废弃，使用schedule_circuit替代）"""
         pass
 
-    def schedule_circuit(self, circuit, start_time: float = None) -> tuple[float, float]:
+    def schedule_circuit(self, circuit, start_time, shots) -> tuple[float, float]:
         """
         为量子线路计算最早开始时间和执行时间，并实际分配资源
         输入：circuit (量子线路), current_time (当前时间) 传进来的是best_start_time
@@ -292,7 +303,7 @@ class QPU:
                 excluded_qubits=occupied if occupied else None,
             )
             if fidelity_stats and 'best_seconds' in fidelity_stats and 'best_fidelity' in fidelity_stats:
-                estimated_seconds = fidelity_stats['best_seconds']
+                estimated_seconds = fidelity_stats['best_seconds'] * shots
                 executed_fidelity = fidelity_stats['best_fidelity']
             else:
                 print("无法获取执行时间")
@@ -317,7 +328,7 @@ class QPU:
         
         return start_time, execution_duration, executed_fidelity
     
-    def calculate_execution_times(self, circuit: QuantumCircuit, current_time: float) -> tuple[float, float]:
+    def calculate_execution_times(self, circuit: QuantumCircuit, current_time, shots) -> tuple[float, float]:
         """
         计算量子线路的最早开始时间和执行时间（不实际分配资源）
         输入：circuit (量子线路), current_time (当前时间)
@@ -341,16 +352,18 @@ class QPU:
                 excluded_qubits=occupied if occupied else None,
             )
             if fidelity_stats and 'best_seconds' in fidelity_stats:
-                estimated_seconds = fidelity_stats['best_seconds']
+                estimated_seconds = fidelity_stats['best_seconds'] * shots
             else:
                 # 如果无法获取，使用默认值
                 estimated_seconds = float('inf')
+                raise Exception("无法获取执行时间")
         except ImportError:
             # 如果无法导入模块，使用默认值
             estimated_seconds = 1.0
         
         # 3. 计算实际执行时间（考虑设备状态）
         execution_duration = estimated_seconds
+        # print(execution_duration)
         
         return earliest_start, execution_duration
     
@@ -512,7 +525,7 @@ class QPU:
 class Scheduler:
     """量子电路调度器"""
     
-    def __init__(self, qpus: list[QPU], circuits: list[Circuit]):
+    def __init__(self, qpus: list[QPU], circuits: list[Circuit] = []):
         self.qpus = qpus
         self.circuits: list[Circuit] = circuits
         self.executed_tasks = []
@@ -546,10 +559,14 @@ class Scheduler:
             }
             memberships = getattr(c, 'partition_memberships', []) or []
             budgets = getattr(c, 'partition_budgets', []) or []
+            cuts_list = getattr(c, 'partition_cuts', []) or []
+            per_counts_list = getattr(c, 'partition_per_counts', []) or []
             for i in range(max(len(memberships), len(budgets))):
                 entry['partitions'].append({
                     'budget': budgets[i] if i < len(budgets) else None,
-                    'membership': memberships[i] if i < len(memberships) else []
+                    'membership': memberships[i] if i < len(memberships) else [],
+                    'cuts': cuts_list[i] if i < len(cuts_list) else 0,
+                    'per_counts': per_counts_list[i] if i < len(per_counts_list) else {}
                 })
             data['circuits'].append(entry)
         with open(target_path, 'w', encoding='utf-8') as f:
@@ -579,8 +596,18 @@ class Scheduler:
             circuit.budgets = list(meta.get('budgets', []) or [])
             parts_meta = meta.get('partitions', []) or []
             circuit.partition_budgets = [p.get('budget') for p in parts_meta]
+            # 初始化 circuit 与 partitions 相关字段
             circuit.partitions = []
             circuit.partition_memberships = []
+            circuit.partition_classical_cost_time = []
+            circuit.partition_classical_cost_space = []
+            circuit.partition_cuts = []
+            circuit.partition_per_counts = []
+            circuit.kept_partition = None
+            circuit.selected_partition = None
+            circuit.selected_partition_idx = None
+            circuit.classical_cost_time = 0.0
+            circuit.classical_cost_space = 0.0
             # 依据 membership 重建子线路（若无法真实重建，则直接占位）
             try:
                 from CircuitCutting.iterationCircuitCut import rebuild_subcircuits_from_membership
@@ -588,34 +615,58 @@ class Scheduler:
                 rebuild_subcircuits_from_membership = None
             for p in parts_meta:
                 membership = p.get('membership') or []
+                cuts = int(p.get('cuts', 0) or 0)
+                per_counts = dict(p.get('per_counts', {}) or {})
                 subcircuits = []
                 if rebuild_subcircuits_from_membership is not None:
-                    try:
-                        subcircuits = rebuild_subcircuits_from_membership(
-                            QuantumCircuit.from_qasm_file(qasmfile), membership
-                        )
-                    except Exception:
-                        subcircuits = []
-                # 回退：若无法重建，则至少创建空占位 task 数组以保持结构
+                    subcircuits = rebuild_subcircuits_from_membership(
+                        QuantumCircuit.from_qasm_file(qasmfile), membership
+                    )
+                # 回退策略：若无法重建，则用 membership 分组数生成占位子线路；若无 membership 则保留整条线路为单 task
                 tasks = []
                 if subcircuits:
                     for sc in subcircuits:
-                        tasks.append(Task(sc, circuit))
+                        tt = Task(sc, circuit)
+                        tasks.append(tt)
+                else:
+                    if membership:
+                        groups = sorted(set(g for g in membership if g is not None and g != -1))
+                        for g in groups:
+                            qcount = sum(1 for x in membership if x == g)
+                            sc = QuantumCircuit(qcount)
+                            tt = Task(sc, circuit)
+                            tasks.append(tt)
+                    else:
+                        tt = Task(circuit.qc, circuit)
+                        tasks.append(tt)
                 circuit.partitions.append(tasks)
                 circuit.partition_memberships.append(list(membership))
+                # 依据保存的 cuts 与 per_counts 还原 shots 分配，规则同 cut()
+                groups = sorted(set(m for m in membership if m != -1))
+                sum_counts = float(sum(per_counts.get(g, 0) for g in groups))
+                scale = SHOTS_SCALE_BASE ** (cuts / 2.0)
+                k = len(tasks) if tasks else 1
+                for idx, tsk in enumerate(tasks):
+                    g = groups[idx] if idx < len(groups) else idx
+                    cnt = float(per_counts.get(g, 0))
+                    if sum_counts > 0:
+                        norm = cnt / sum_counts
+                    else:
+                        norm = 1.0 / float(k)
+                    if tsk.shots == 0:
+                        tsk.shots = SHOTS_BASE
+                    else:
+                        tsk.shots = norm * scale * SHOTS_BASE
+                # 经典代价占位（可按需后续覆盖）
+                circuit.partition_classical_cost_time.append(0.0)
+                circuit.partition_classical_cost_space.append(0.0)
+                circuit.partition_cuts.append(cuts)
+                circuit.partition_per_counts.append(per_counts)
             loaded.append(circuit)
-        # 覆盖调度器的电路集
-        self.circuits = loaded
+        # 将加载的线路追加到调度器
+        self.circuits.extend(loaded)
 
 
-    def schedule(self):
-        self.cut_circuits()
-        #todo 计算各个线路的优先级
-        pass
-        #todo调度任务
-        
-        max_end_time = max(qpu.end_time() for qpu in self.qpus)
-        return max_end_time
 
     def _reconstruct_fidelity_geom(self, fidelities: list[float]) -> float | None:
         """
@@ -640,6 +691,239 @@ class Scheduler:
         3) 为tasks计算初始优先级；
         4) 迭代调度（与先前相同）。
         """
+        # 预处理：评分函数
+        score = score_fn if score_fn is not None else self._score_plan
+        w1, w2, w3 = (weights if (isinstance(weights, (list, tuple)) and len(weights) == 3) else (3.0, 2.0, 1.0))
+
+        # Step 1: 方案按 F_min 阈值过滤（方案保真度=子线路最佳保真度的重构值）
+        circuit_to_filtered_plans = {}
+        any_infeasible = False
+        infeasible_circuit = None
+        for c in self.circuits:
+            plans = getattr(c, 'partitions', []) or []  # 每个元素是一个方案(list[Task])
+            # F_min^i：优先使用 required_fidelity['fidelity_requirement']
+            thr = 0.0
+            rf = getattr(c, 'required_fidelity', None)
+            if isinstance(rf, dict):
+                try:
+                    thr = float(rf.get('fidelity_requirement', 0.0))
+                except Exception:
+                    thr = 0.0
+            else:
+                try:
+                    thr = float(rf) if rf is not None else 0.0
+                except Exception:
+                    thr = 0.0
+
+            kept = []
+            for plan in plans:
+                # 逐子线路估计最佳保真度与时间
+                best_fids = []
+                if len(plan) == 1:
+                    if plan[0].circuit.num_qubits <= min(getattr(chip, 'num_qubits', 0) for chip in self.qpus):
+                        kept.append(plan)
+                        continue
+                for task in plan:
+                    if getattr(task, 'estimated_fidelity', None) is None or getattr(task, 'estimated_seconds', None) is None:
+                        best_fid = 0
+                        best_seconds = float('inf')
+                        for qpu in self.qpus:
+                            try:
+                                est = estimate_best_fidelity_and_logical_stats(task.circuit, qpu.backend_name)
+                                best_fid = max(best_fid, est['best_fidelity']) if est and 'best_fidelity' in est else None
+                                best_seconds = min(best_seconds, est['best_seconds']) * task.shots if est and 'best_seconds' in est else None
+                            except Exception:
+                                best_fid = None
+                                best_seconds = None
+                        task.estimated_fidelity = best_fid
+                        task.estimated_seconds = best_seconds
+                    if task.estimated_fidelity is not None:
+                        best_fids.append(float(task.estimated_fidelity))
+                # 方案保真度：几何均值重构
+                plan_fid = self._reconstruct_fidelity_geom(best_fids)
+                if plan_fid is None:
+                    continue
+                if plan_fid >= thr:
+                    kept.append(plan)
+            circuit_to_filtered_plans[c] = kept
+            c.kept_partition = kept
+            if not kept:
+                any_infeasible = True
+                infeasible_circuit = c
+                break
+
+        if any_infeasible:
+            return {
+                'status': 'infeasible',
+                'message': f"无法执行：任务{getattr(infeasible_circuit, 'name', '?')}在当前阈值与资源条件下无可行方案",
+                'circuit': getattr(infeasible_circuit, 'name', None)
+            }
+
+        # Step 2: 评分与初选方案（S最小）
+        chosen_plan_per_circuit = {}
+        for c, kept in circuit_to_filtered_plans.items():
+            if not kept:
+                continue
+            def plan_cost_S(plan):
+                # 最大子线路qubits
+                max_qubits = 0
+                sum_seconds = 0.0
+                # 优先使用预计算的方案级经典时间成本
+                classical_time = None
+                for t in plan:
+                    try:
+                        qn = int(getattr(t.circuit, 'num_qubits', 0))
+                    except Exception:
+                        qn = 0
+                    if qn > max_qubits:
+                        max_qubits = qn
+                    # seconds
+                    sec = getattr(t, 'estimated_seconds', None)
+                    if sec is None:
+                        try:
+                            # 估计器已按多QPU取优，这里兜底
+                            est = estimate_best_fidelity_and_logical_stats(t.circuit, self.qpus[0].backend_name if self.qpus else None)
+                            sec = est['best_seconds'] * t.shots if est and 'best_seconds' in est else 0.0
+                            t.estimated_seconds = sec
+                        except Exception:
+                            sec = 0.0
+                    try:
+                        sum_seconds += float(sec or 0.0)
+                    except Exception:
+                        pass
+                # classical time: 方案级
+                try:
+                    if hasattr(c, 'partitions') and plan in getattr(c, 'partitions', []):
+                        idx = c.partitions.index(plan)
+                        pct_list = getattr(c, 'partition_classical_cost_time', None)
+                        if isinstance(pct_list, list) and idx < len(pct_list):
+                            classical_time = float(pct_list[idx])
+                except Exception:
+                    classical_time = None
+                if classical_time is None:
+                    # 兜底回退为 shots*UNIT_EXECUTION_TIME 的和
+                    tmp = 0.0
+                    for t in plan:
+                        try:
+                            tmp += float(getattr(t, 'shots', 0.0) or 0.0) * UNIT_EXECUTION_TIME
+                        except Exception:
+                            pass
+                    classical_time = tmp
+                # S作为该线路需要的全部执行时间
+                total_execution_time = (w1 * float(max_qubits)) + (w2 * float(sum_seconds)) + (w3 * float(classical_time))
+                return total_execution_time
+
+            scored = [(plan_cost_S(plan), plan) for plan in kept]
+            scored.sort(key=lambda x: x[0])  # 越小越好
+            chosen_plan_per_circuit[c] = {
+                'all_plans': [p for _, p in scored],
+                'best_plan': scored[0][1],
+                'best_score': scored[0][0],
+            }
+
+        # 将被选方案的经典代价写回 circuit（用于后续经典资源利用率与排程）
+        for c, meta in chosen_plan_per_circuit.items():
+            try:
+                best_plan = meta.get('best_plan')
+                if hasattr(c, 'partitions') and best_plan in getattr(c, 'partitions', []):
+                    idx = c.partitions.index(best_plan)
+                    pct = getattr(c, 'partition_classical_cost_time', None)
+                    pcs = getattr(c, 'partition_classical_cost_space', None)
+                    if isinstance(pct, list) and idx < len(pct):
+                        c.classical_cost_time = float(pct[idx])
+                    if isinstance(pcs, list) and idx < len(pcs):
+                        c.classical_cost_space = float(pcs[idx])
+                    # 记录所选方案
+                    c.selected_partition = best_plan
+                    c.selected_partition_idx = idx
+            except Exception:
+                pass
+
+        # 初始任务队列
+        tasks = []
+        for meta in chosen_plan_per_circuit.values():
+            best = meta['best_plan']
+            tasks.extend(best)
+
+        # Step 3: 计算每个task的优先级
+        time_now = 0.0
+        self._compute_task_priorities(tasks, time_now)
+
+        # Step 4: 调度循环（基于 P 优先，平手时按 EFT/比特数/轮转 规则）
+        time_now = 0.0
+        schedule_log = []
+        remaining = set(tasks)
+        # 轮转防饥饿：记录每个电路最近被选择的事件序号，越小代表越久未被选择
+        event_index = 0
+        last_pick_index_by_circuit = {}
+        while remaining:
+            ready_list = list(remaining)
+            if not ready_list:
+                break
+
+            # 先找出最大优先级 P 的候选集合
+            max_priority = max(getattr(t, 'priority', 0.0) for t in ready_list)
+            if max_priority == 0.0:
+                # 没有可执行任务
+                # 推进时间到下一个节点
+                time_now = self._next_resource_release_time(time_now)
+                if time_now == float('inf'):
+                    print("没有可执行任务")
+                    break
+                self._schedule_ready_classical_jobs(time_now, schedule_log)
+                self._update_all_priorities(remaining, time_now)
+                continue
+            cand_list = [t for t in ready_list if getattr(t, 'priority', 0.0) == max_priority]
+            # 平手规则：EFT 更小优先；若仍并列，qubits 更大优先；若仍并列，按轮转（最近最少被选）
+            eft_map = self._compute_earliest_finish_times(cand_list, time_now)
+            def tie_key(t):
+                eft = eft_map.get(t, float('inf'))
+                qubits = getattr(getattr(t, 'circuit', None), 'num_qubits', 0)
+                circuit = getattr(t, 'parent', None)
+                last_idx = last_pick_index_by_circuit.get(circuit, -1)
+                return (eft, -qubits, last_idx)
+
+            selected = min(cand_list, key=tie_key)
+
+            # 放置于 Chip*(task, t)：按最小 EFT 的设备进行放置，位置为“最早可行开始时刻”
+            start, end = self._execute_task(selected, time_now)
+            schedule_log.append({'event': 'run', 'start': start, 'end': end, 'qpu': selected.assigned_qpu.backend_name, 'fidelity': selected.fidelity, 'shots': selected.shots})
+            # print(selected.shots)
+            # print(end)
+
+            # 时间推进到放置事件时刻（事件驱动：放置/完成后更新）
+            # time_now = max(time_now, start)
+            owner_circuit = getattr(selected, 'parent', None)
+            last_pick_index_by_circuit[owner_circuit] = event_index
+            event_index += 1
+
+            # 从就绪集中移除已完成任务，更新优先级（事件驱动）
+            remaining.remove(selected)
+            self._update_all_priorities(remaining, time_now)
+
+            # 放置量子任务后，尝试调度经典作业（事件驱动：量子放置/完成后）
+            self._schedule_ready_classical_jobs(time_now, schedule_log)
+        
+        while time_now < float('inf'):
+            time_now = self._next_resource_release_time(time_now)
+            self._schedule_ready_classical_jobs(time_now, schedule_log)
+        return schedule_log
+
+
+    def online_schedule(self, score_fn=None, prob_switch: float = 0.2, weights: tuple | None = None):
+        """
+        1.新线路到达
+        2.资源释放
+        3.就绪任务的优先级更新
+
+        给circuit按照到达时间排序
+
+        新线路到达、加载其分割方案至子线路队列
+
+        创建空的task列表
+        """
+        self.circuits.sort(key=lambda x: getattr(x, 'arrival_time', float('inf')))
+        
         # 预处理：评分函数
         score = score_fn if score_fn is not None else self._score_plan
         w1, w2, w3 = (weights if (isinstance(weights, (list, tuple)) and len(weights) == 3) else (3.0, 2.0, 1.0))
@@ -790,71 +1074,82 @@ class Scheduler:
 
         # 初始任务队列
         tasks = []
-        for meta in chosen_plan_per_circuit.values():
-            best = meta['best_plan']
-            tasks.extend(best)
-
-        # Step 3: 计算每个task的优先级
-        time_now = 0.0
-        self._compute_task_priorities(tasks, time_now)
-
-        # Step 4: 调度循环（基于 P 优先，平手时按 EFT/比特数/轮转 规则）
+        next_check_circuits_index = 0
         time_now = 0.0
         schedule_log = []
-        remaining = set(tasks)
-        # 轮转防饥饿：记录每个电路最近被选择的事件序号，越小代表越久未被选择
-        event_index = 0
-        last_pick_index_by_circuit = {}
-        while remaining:
-            ready_list = list(remaining)
-            if not ready_list:
-                break
-
-            # 先找出最大优先级 P 的候选集合
-            max_priority = max(getattr(t, 'priority', 0.0) for t in ready_list)
-            if max_priority == 0.0:
-                # 没有可执行任务
-                # 推进时间到下一个节点
-                time_now = self._next_resource_release_time(time_now)
-                if time_now == float('inf'):
-                    print("没有可执行任务")
-                    break
-                self._schedule_ready_classical_jobs(time_now, schedule_log)
-                self._update_all_priorities(remaining, time_now)
-                continue
-            cand_list = [t for t in ready_list if getattr(t, 'priority', 0.0) == max_priority]
-            # 平手规则：EFT 更小优先；若仍并列，qubits 更大优先；若仍并列，按轮转（最近最少被选）
-            eft_map = self._compute_earliest_finish_times(cand_list, time_now)
-            def tie_key(t):
-                eft = eft_map.get(t, float('inf'))
-                qubits = getattr(getattr(t, 'circuit', None), 'num_qubits', 0)
-                circuit = getattr(t, 'parent', None)
-                last_idx = last_pick_index_by_circuit.get(circuit, -1)
-                return (eft, -qubits, last_idx)
-
-            selected = min(cand_list, key=tie_key)
-
-            # 放置于 Chip*(task, t)：按最小 EFT 的设备进行放置，位置为“最早可行开始时刻”
-            start, end = self._execute_task(selected, time_now)
-            schedule_log.append({'event': 'run', 'start': start, 'end': end, 'qpu': selected.assigned_qpu.backend_name})
-
-            # 时间推进到放置事件时刻（事件驱动：放置/完成后更新）
-            # time_now = max(time_now, start)
-            owner_circuit = getattr(selected, 'parent', None)
-            last_pick_index_by_circuit[owner_circuit] = event_index
-            event_index += 1
-
-            # 从就绪集中移除已完成任务，更新优先级（事件驱动）
-            remaining.remove(selected)
-            self._update_all_priorities(remaining, time_now)
-
-            # 放置量子任务后，尝试调度经典作业（事件驱动：量子放置/完成后）
-            self._schedule_ready_classical_jobs(time_now, schedule_log)
-        
+        # 新线路到达
         while time_now < float('inf'):
-            time_now = self._next_resource_release_time(time_now)
+            for i in range(next_check_circuits_index, len(self.circuits)):
+                c = self.circuits[i]    
+                if c.arrival_time <= time_now:
+                    for plan in c.kept_partition:
+                        for t in plan:
+                            tasks.append(t)
+                    next_check_circuits_index = i + 1
+                else:
+                    break
+
+
+            # Step 3: 计算每个task的优先级 
+            self._compute_task_priorities(tasks, time_now)
+
+            # Step 4: 调度循环（基于 P 优先，平手时按 EFT/比特数/轮转 规则）
+            remaining = set(tasks)
+            # 轮转防饥饿：记录每个电路最近被选择的事件序号，越小代表越久未被选择
+            event_index = 0
+            last_pick_index_by_circuit = {}
+            while remaining:
+                ready_list = list(remaining)
+
+                # 先找出最大优先级 P 的候选集合
+                max_priority = max(getattr(t, 'priority', 0.0) for t in ready_list)
+                if max_priority == 0.0:
+                    # 没有可执行任务
+                    # 推进时间到下一个节点
+                    break
+                cand_list = [t for t in ready_list if getattr(t, 'priority', 0.0) == max_priority]
+                # 平手规则：EFT 更小优先；若仍并列，qubits 更大优先；若仍并列，按轮转（最近最少被选）
+                eft_map = self._compute_earliest_finish_times(cand_list, time_now)
+                def tie_key(t):
+                    eft = eft_map.get(t, float('inf'))
+                    qubits = getattr(getattr(t, 'circuit', None), 'num_qubits', 0)
+                    circuit = getattr(t, 'parent', None)
+                    last_idx = last_pick_index_by_circuit.get(circuit, -1)
+                    return (eft, -qubits, last_idx)
+
+                selected = min(cand_list, key=tie_key)
+
+                # 放置于 Chip*(task, t)：按最小 EFT 的设备进行放置，位置为“最早可行开始时刻”
+                start, end = self._execute_task(selected, time_now)
+                schedule_log.append({'event': 'run', 'start': start, 'end': end, 'qpu': selected.assigned_qpu.backend_name, 'fidelity': selected.fidelity, 'shots': selected.shots})
+                # print(f"run        | start={start:.6f} end={end:.6f} qpu={selected.assigned_qpu.backend_name}")
+
+                # 时间推进到放置事件时刻（事件驱动：放置/完成后更新）
+                # time_now = max(time_now, start)
+                owner_circuit = getattr(selected, 'parent', None)
+                last_pick_index_by_circuit[owner_circuit] = event_index
+                event_index += 1
+
+                # 从就绪集中移除已完成任务，更新优先级（事件驱动）
+                remaining.remove(selected)
+                tasks.remove(selected)
+                self._update_all_priorities(remaining, time_now)
+
+                # 放置量子任务后，尝试调度经典作业（事件驱动：量子放置/完成后）
+                self._schedule_ready_classical_jobs(time_now, schedule_log)
+            
+            # 线路到达时间、资源释放时间
+            next_release_time = self._next_resource_release_time(time_now)
+            # 经典资源释放时间
+            next_arrival_time = self.circuits[next_check_circuits_index].arrival_time if next_check_circuits_index < len(self.circuits) else float('inf')
+            time_now = min(next_release_time, next_arrival_time)
             self._schedule_ready_classical_jobs(time_now, schedule_log)
+
+
         return schedule_log
+
+
+
 
     # ============ 以下为可覆盖/可扩展的辅助方法（框架/占位） ============
     def _score_plan(self, circuit: Circuit, plan: list[Task]) -> float:
@@ -884,7 +1179,7 @@ class Scheduler:
         eft_dict = self._compute_earliest_finish_times(tasks, time_now)
         
         # 计算装载友好性指标
-        # Todo 应该是当前所有设备中，空闲量子比特数目最大的区域，并考虑正在执行的任务的占据情况
+        # 应该是当前所有设备中，空闲量子比特数目最大的区域，并考虑正在执行的任务的占据情况
         max_device_qubits = max(qpu.num_qubits for qpu in self.qpus) if self.qpus else 1
         load_friendliness = self._compute_load_friendliness(tasks, max_device_qubits)
         
@@ -896,11 +1191,26 @@ class Scheduler:
         beta = 1.0    # 尽早完工权重
         gamma = 0.5   # 装载友好性权重
         lambda_param = 0.5  # 解锁紧迫度调制参数
+        zeta = 1.5    # 轮转时间（到达-当前差值越小越好）的权重
         
                 # 线性归一化：1 - norm(EFT)，越小越好
         eft_values = [v for v in eft_dict.values() if v != float('inf')]
         if eft_values:
             min_eft, max_eft = min(eft_values), max(eft_values)
+
+        # 轮转时间（arrive_time 与 time_now 的差值）归一化：差值越小越好
+        arrive_deltas = []
+        for t in tasks:
+            circuit = getattr(t, 'parent', None)
+            at = float(getattr(circuit, 'arrival_time', 0.0) or 0.0)
+            delta = max(0.0, time_now - at)
+            arrive_deltas.append(delta)
+        if arrive_deltas:
+            min_delta = min(arrive_deltas)
+            max_delta = max(arrive_deltas)
+        else:
+            min_delta = 0.0
+            max_delta = 0.0
 
         for t in tasks:
             # 1. 解锁经典资源的紧迫程度
@@ -944,10 +1254,21 @@ class Scheduler:
             # 3. 装载友好性（归一化）
             load_score = load_friendliness.get(t, 0.0)
             
-            # 4. 综合优先级计算
+            # 4. 轮转时间（到达时间靠近当前时刻者优先）
+            
+            at = float(getattr(getattr(t, 'parent', None), 'arrival_time', 0.0) or 0.0)
+            
+            delta = max(0.0, time_now - at)
+            if max_delta > min_delta:
+                rr_score = 1.0 - (delta - min_delta) / (max_delta - min_delta)
+            else:
+                rr_score = 1.0
+            
+            # 5. 综合优先级计算
             priority = (alpha * modulation_factor * unlock_urgency + 
                        beta * early_finish + 
-                       gamma * load_score)
+                       gamma * load_score +
+                       zeta * rr_score)
             
             t.priority = priority
 
@@ -960,8 +1281,12 @@ class Scheduler:
         for circuit in self.circuits:
             # 这里需要根据实际调度状态计算
             # 简化实现：假设所有circuit的经典成本都在执行
-            if hasattr(circuit, 'classical_cost_space'):
-                total_classical_cost += circuit.classical_cost_space
+            if self.classical_allocations:
+                for job in self.classical_allocations:
+                    if job['circuit'] == circuit and job['start'] <= time_now and job['end'] >= time_now:
+                        total_classical_cost += job['space']
+            # if hasattr(circuit, 'classical_cost_space'):
+                # total_classical_cost += circuit.classical_cost_space
         
         utilization = min(1.0, total_classical_cost / classical_resource_limit)
         return utilization
@@ -987,9 +1312,12 @@ class Scheduler:
             # 遍历所有设备，找到最早完工时间
             for qpu in self.qpus:
                 # 使用QPU的calculate_execution_times方法（不实际分配资源）
+                if qpu.num_qubits < task.circuit.num_qubits:
+                    continue
                 start_time, duration = qpu.calculate_execution_times(
                     task.circuit, 
-                    time_now
+                    time_now,
+                    task.shots
                 )
                 if start_time > time_now:
                     continue
@@ -1008,7 +1336,8 @@ class Scheduler:
         # 使用QPU的calculate_execution_times方法
         start_time, _ = qpu.calculate_execution_times(
             task.circuit, 
-            time_now
+            time_now,
+            task.shots
         )
         return start_time
 
@@ -1075,9 +1404,12 @@ class Scheduler:
         
         for qpu in self.qpus:
             # 逐设备评估最早开始与完工时间
+            if qpu.num_qubits < task.circuit.num_qubits:
+                continue
             start_time, duration = qpu.calculate_execution_times(
                 task.circuit,
-                time_now
+                time_now,
+                task.shots
             )
             eft = start_time + duration
             if eft < best_eft or (math.isfinite(eft) and not math.isfinite(best_eft)):
@@ -1088,7 +1420,8 @@ class Scheduler:
         # 使用QPU的schedule_circuit方法
         start_time, duration, execute_fidelity = best_qpu.schedule_circuit(
             task.circuit, 
-            best_start_time
+            best_start_time,
+            task.shots
         )
         if execute_fidelity == 0.0:
             print("执行失败")

@@ -1189,6 +1189,7 @@ def estimate_best_fidelity_and_logical_stats(circuit, chip_name: str, two_q_gate
     candidates = find_best_region_by_avg_performance(circuit, backend, two_q_gate_name=two_q_gate_name, max_regions=max_regions, excluded_qubits=excluded_qubits)
 
     if not candidates:
+        # print("no candidates")
         return None
 
     best = None
@@ -1204,6 +1205,7 @@ def estimate_best_fidelity_and_logical_stats(circuit, chip_name: str, two_q_gate
         best = item
 
     if best is None:
+        print("no best")
         return None
 
     # 统计逻辑比特的原始cx / swap / 比值（需初始布局）
