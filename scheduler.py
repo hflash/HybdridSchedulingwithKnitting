@@ -248,24 +248,25 @@ class QPU:
         """添加任务到设备（已废弃，使用schedule_circuit替代）"""
         pass
 
-    def schedule_circuit(self, circuit, current_time: float = None) -> tuple[float, float]:
+    def schedule_circuit(self, circuit, start_time: float = None) -> tuple[float, float]:
         """
         为量子线路计算最早开始时间和执行时间，并实际分配资源
-        输入：circuit (量子线路), current_time (当前时间)
+        输入：circuit (量子线路), current_time (当前时间) 传进来的是best_start_time
         输出：(earliest_start_time, execution_duration)
         """
-        if current_time is None:
-            current_time = self.current_time
+        # if current_time is None:
+        #     current_time = self.current_time
         
         required_qubits = circuit.num_qubits
         
         # 1. 计算最早开始时间
-        earliest_start = self._find_earliest_start_time(required_qubits, current_time)
-        
+        # earliest_start = self._find_earliest_start_time(required_qubits, current_time)
+        # earliest_start = start_time # 直接使用best_start_time
+
         # 2. 使用performanceAccessing函数估算执行时间（考虑当前时刻占用比特作为excluded_qubits）
         try:
             from CircuitCutting.performanceAccessing import estimate_best_fidelity_and_logical_stats
-            occupied = set(self._get_occupied_qubits_at_time(current_time))
+            occupied = set(self._get_occupied_qubits_at_time(start_time))
             fidelity_stats = estimate_best_fidelity_and_logical_stats(
                 circuit,
                 self.backend_name,
@@ -273,11 +274,13 @@ class QPU:
                 max_regions=200,
                 excluded_qubits=occupied if occupied else None,
             )
-            if fidelity_stats and 'best_seconds' in fidelity_stats:
+            if fidelity_stats and 'best_seconds' in fidelity_stats and 'best_fidelity' in fidelity_stats:
                 estimated_seconds = fidelity_stats['best_seconds']
+                executed_fidelity = fidelity_stats['best_fidelity']
             else:
                 print("无法获取执行时间")
-                estimated_seconds = 1.0
+                estimated_seconds = 1000.0
+                executed_fidelity = 0.0
         except ImportError:
             estimated_seconds = 1.0
         
@@ -285,17 +288,17 @@ class QPU:
         execution_duration = estimated_seconds
         
         # 4. 分配具体的量子比特
-        allocated_qubits = self._allocate_qubits(required_qubits, earliest_start)
+        allocated_qubits = self._allocate_qubits(required_qubits, start_time)
         
         # 5. 更新设备时间线
-        end_time = earliest_start + execution_duration
-        allocation = (earliest_start, end_time, circuit, allocated_qubits)
+        end_time = start_time + execution_duration
+        allocation = (start_time, end_time, circuit, allocated_qubits)
         self.allocations.append(allocation)
         
         # 6. 更新当前时间
         # self.current_time = max(self.current_time, end_time)
         
-        return earliest_start, execution_duration
+        return start_time, execution_duration, executed_fidelity
     
     def calculate_execution_times(self, circuit: QuantumCircuit, current_time: float) -> tuple[float, float]:
         """
@@ -714,7 +717,10 @@ class Scheduler:
             if max_priority == 0.0:
                 # 没有可执行任务
                 # 推进时间到下一个节点
-                time_now = self._next_resource_release_time(self.qpus[0], time_now)
+                time_now = self._next_resource_release_time(time_now)
+                if time_now == float('inf'):
+                    print("没有可执行任务")
+                    break
                 self._update_all_priorities(remaining, time_now)
                 continue
             cand_list = [t for t in ready_list if getattr(t, 'priority', 0.0) == max_priority]
@@ -745,7 +751,10 @@ class Scheduler:
 
             # 放置量子任务后，尝试调度经典作业（事件驱动：量子放置/完成后）
             self._schedule_ready_classical_jobs(time_now, schedule_log)
-
+        
+        while time_now < float('inf'):
+            time_now = self._next_resource_release_time(time_now)
+            self._schedule_ready_classical_jobs(time_now, schedule_log)
         return schedule_log
 
     # ============ 以下为可覆盖/可扩展的辅助方法（框架/占位） ============
@@ -978,16 +987,20 @@ class Scheduler:
                 best_qpu = qpu
         
         # 使用QPU的schedule_circuit方法
-        start_time, duration = best_qpu.schedule_circuit(
+        start_time, duration, execute_fidelity = best_qpu.schedule_circuit(
             task.circuit, 
-            time_now
+            best_start_time
         )
+        if execute_fidelity == 0.0:
+            print("执行失败")
+            print(task.parent.name)
         end_time = start_time + duration
         
         # 更新任务状态
         task.start_time = start_time
         task.end_time = end_time
         task.assigned_qpu = best_qpu
+        task.fidelity = execute_fidelity
         self.executed_tasks.append(task)
         return start_time, end_time
 
@@ -997,7 +1010,7 @@ class Scheduler:
         self._compute_task_priorities(list(tasks), time_now)
 
 
-    def _next_resource_release_time(self, qpu: QPU, current_time: float) -> float:
+    def _next_resource_release_time(self, current_time: float) -> float:
         """获取下一个资源释放时间"""
         # 找到下一个任务结束时间
         next_release = float('inf')
@@ -1070,7 +1083,7 @@ class Scheduler:
         """
         ready = self._enum_ready_classical_jobs(time_now)
         if not ready:
-            return
+            return False
         # LPT：按持续时间从长到短
         ready.sort(key=lambda x: x[2], reverse=True)
         for circuit, space, dur, ready_time in ready:
@@ -1082,6 +1095,7 @@ class Scheduler:
             self.classical_allocations.append({'circuit': circuit, 'start': start_c, 'end': end_c, 'space': space})
             self.classical_jobs_scheduled.add(circuit)
             schedule_log.append({'event': 'run_classical', 'circuit': getattr(circuit, 'name', None), 'start': start_c, 'end': end_c, 'space': space})
+        return True
 
     def _dynamic_alpha(self, time_now: float, alpha_base: float) -> float:
         """根据经典侧拥塞动态调整量子侧权重 α。
