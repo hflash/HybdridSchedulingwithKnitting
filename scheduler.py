@@ -12,6 +12,9 @@ from CircuitCutting.iterationCircuitCut import compute_subcircuits_with_budget
 # 宏定义：shots分配的基数
 SHOTS_SCALE_BASE = 4.0
 
+# 宏定义：预算的最大值；经典资源上限 = 4^BUDGET_MAX
+BUDGET_MAX = 10
+
 # 宏定义：单位执行时间（基于3.4GHz时钟频率）
 UNIT_EXECUTION_TIME = 1.0 / 3.4e9  # 秒
 
@@ -76,6 +79,9 @@ class Circuit:
         # 清空旧方案与本次各方案的实际花费
         self.partitions = []
         self.partition_budgets = []
+        # 按方案记录经典代价（时间/空间）
+        self.partition_classical_cost_time = []
+        self.partition_classical_cost_space = []
 
         # 读取原始电路（Qiskit对象）
         try:
@@ -140,11 +146,17 @@ class Circuit:
             except Exception:
                 used_b = int(budget) if isinstance(budget, (int, float)) else 0
             self.partition_budgets.append(used_b)
+            # 记录该方案的经典代价：shots 之和作为空间，乘以单位时间作为时间
+            try:
+                part_shots = float(sum(getattr(t, 'shots', 0.0) or 0.0 for t in partition))
+            except Exception:
+                part_shots = 0.0
+            self.partition_classical_cost_space.append(part_shots)
+            self.partition_classical_cost_time.append(part_shots * UNIT_EXECUTION_TIME)
         # 方案生成完成
-        # classical_cost分为时间和空间两个部分
-        total_shots = sum(sum(task.shots for task in partition) for partition in self.partitions)
-        self.classical_cost_time = total_shots * UNIT_EXECUTION_TIME
-        self.classical_cost_space = total_shots
+        # classical_cost（总值）将在选择方案后设置为所选方案的代价
+        self.classical_cost_time = 0.0
+        self.classical_cost_space = 0.0
     
     def finish_time(self):
         #返回线路完成时间
@@ -189,7 +201,11 @@ class Circuit:
             cand_list = [b for b in cand_list if b > 0]
             # 去重并按升序排序
             cand_list = sorted(list(dict.fromkeys(cand_list)))
+            cand_list = [b for b in cand_list if b <= BUDGET_MAX]
+            if len(cand_list) < 3:
+                cand_list.append(BUDGET_MAX)
             self.budgets = cand_list
+            print(self.budgets)
             # 保留原始候选映射与详细信息
             # self.budget_candidates = budgets_int
             # 可选：保存细节供上层查看
@@ -277,7 +293,7 @@ class QPU:
         self.allocations.append(allocation)
         
         # 6. 更新当前时间
-        self.current_time = max(self.current_time, end_time)
+        # self.current_time = max(self.current_time, end_time)
         
         return earliest_start, execution_duration
     
@@ -480,6 +496,10 @@ class Scheduler:
         self.qpus = qpus
         self.circuits: list[Circuit] = circuits
         self.executed_tasks = []
+        # 经典资源：容量限制与时间线（limit = 4^BUDGET_MAX）
+        self.classical_resource_limit = float(SHOTS_SCALE_BASE ** BUDGET_MAX)
+        self.classical_allocations = []  # [{'circuit': c, 'start': s, 'end': e, 'space': x}]
+        self.classical_jobs_scheduled = set()  # 已调度经典作业的电路集合
         # 移除重复的设备状态跟踪，使用QPU类内置的时间线管理
     
     def add_circuit(self, circuit: Circuit):
@@ -596,7 +616,8 @@ class Scheduler:
                 # 最大子线路qubits
                 max_qubits = 0
                 sum_seconds = 0.0
-                classical_time = 0.0
+                # 优先使用预计算的方案级经典时间成本
+                classical_time = None
                 for t in plan:
                     try:
                         qn = int(getattr(t.circuit, 'num_qubits', 0))
@@ -608,7 +629,8 @@ class Scheduler:
                     sec = getattr(t, 'estimated_seconds', None)
                     if sec is None:
                         try:
-                            est = estimate_best_fidelity_and_logical_stats(t.circuit, chip_name)
+                            # 估计器已按多QPU取优，这里兜底
+                            est = estimate_best_fidelity_and_logical_stats(t.circuit, self.qpus[0].backend_name if self.qpus else None)
                             sec = est['best_seconds'] if est and 'best_seconds' in est else 0.0
                             t.estimated_seconds = sec
                         except Exception:
@@ -617,11 +639,24 @@ class Scheduler:
                         sum_seconds += float(sec or 0.0)
                     except Exception:
                         pass
-                    # classical time proxy: use shots
-                    try:
-                        classical_time += float(getattr(t, 'shots', 0.0) or 0.0) * UNIT_EXECUTION_TIME
-                    except Exception:
-                        pass
+                # classical time: 方案级
+                try:
+                    if hasattr(c, 'partitions') and plan in getattr(c, 'partitions', []):
+                        idx = c.partitions.index(plan)
+                        pct_list = getattr(c, 'partition_classical_cost_time', None)
+                        if isinstance(pct_list, list) and idx < len(pct_list):
+                            classical_time = float(pct_list[idx])
+                except Exception:
+                    classical_time = None
+                if classical_time is None:
+                    # 兜底回退为 shots*UNIT_EXECUTION_TIME 的和
+                    tmp = 0.0
+                    for t in plan:
+                        try:
+                            tmp += float(getattr(t, 'shots', 0.0) or 0.0) * UNIT_EXECUTION_TIME
+                        except Exception:
+                            pass
+                    classical_time = tmp
                 # S作为该线路需要的全部执行时间
                 total_execution_time = (w1 * float(max_qubits)) + (w2 * float(sum_seconds)) + (w3 * float(classical_time))
                 return total_execution_time
@@ -633,6 +668,24 @@ class Scheduler:
                 'best_plan': scored[0][1],
                 'best_score': scored[0][0],
             }
+
+        # 将被选方案的经典代价写回 circuit（用于后续经典资源利用率与排程）
+        for c, meta in chosen_plan_per_circuit.items():
+            try:
+                best_plan = meta.get('best_plan')
+                if hasattr(c, 'partitions') and best_plan in getattr(c, 'partitions', []):
+                    idx = c.partitions.index(best_plan)
+                    pct = getattr(c, 'partition_classical_cost_time', None)
+                    pcs = getattr(c, 'partition_classical_cost_space', None)
+                    if isinstance(pct, list) and idx < len(pct):
+                        c.classical_cost_time = float(pct[idx])
+                    if isinstance(pcs, list) and idx < len(pcs):
+                        c.classical_cost_space = float(pcs[idx])
+                    # 记录所选方案
+                    c.selected_partition = best_plan
+                    c.selected_partition_idx = idx
+            except Exception:
+                pass
 
         # 初始任务队列
         tasks = []
@@ -678,7 +731,7 @@ class Scheduler:
 
             # 放置于 Chip*(task, t)：按最小 EFT 的设备进行放置，位置为“最早可行开始时刻”
             start, end = self._execute_task(selected, time_now)
-            schedule_log.append({'event': 'run', 'task': selected, 'start': start, 'end': end})
+            schedule_log.append({'event': 'run', 'start': start, 'end': end, 'qpu': selected.assigned_qpu.backend_name})
 
             # 时间推进到放置事件时刻（事件驱动：放置/完成后更新）
             # time_now = max(time_now, start)
@@ -689,6 +742,9 @@ class Scheduler:
             # 从就绪集中移除已完成任务，更新优先级（事件驱动）
             remaining.remove(selected)
             self._update_all_priorities(remaining, time_now)
+
+            # 放置量子任务后，尝试调度经典作业（事件驱动：量子放置/完成后）
+            self._schedule_ready_classical_jobs(time_now, schedule_log)
 
         return schedule_log
 
@@ -725,7 +781,10 @@ class Scheduler:
         load_friendliness = self._compute_load_friendliness(tasks, max_device_qubits)
         
         # 优先级参数设置
-        alpha = 10.0  # 解锁紧迫度权重（最高）
+        # 量子侧 α：可根据经典侧拥塞动态调节
+        # 拥塞度定义：经典 ready 作业的总空间需求/limit 或 经典时间线当前利用率的组合
+        alpha_base = 10.0
+        alpha = self._dynamic_alpha(time_now, alpha_base)
         beta = 1.0    # 尽早完工权重
         gamma = 0.5   # 装载友好性权重
         lambda_param = 0.5  # 解锁紧迫度调制参数
@@ -942,7 +1001,105 @@ class Scheduler:
         """获取下一个资源释放时间"""
         # 找到下一个任务结束时间
         next_release = float('inf')
+        # 量子侧：已执行任务的结束时间
         for task in self.executed_tasks:
-            if task.end_time > current_time:
+            if getattr(task, 'end_time', float('inf')) > current_time:
                 next_release = min(next_release, task.end_time)
+        # 经典侧：已调度经典作业的结束时间
+        for job in getattr(self, 'classical_allocations', []) or []:
+            end = job.get('end', float('inf'))
+            if end > current_time:
+                next_release = min(next_release, end)
         return next_release
+
+    # ----------------- 经典作业调度 -----------------
+    def _classical_timeline_load_at(self, time_point: float) -> float:
+        """返回经典资源在 time_point 的占用（空间单位：shots 数）。"""
+        load = 0.0
+        for job in self.classical_allocations:
+            if job['start'] <= time_point < job['end']:
+                load += float(job.get('space', 0.0) or 0.0)
+        return load
+
+    def _classical_has_capacity(self, time_point: float, demand: float) -> bool:
+        """检查 time_point 是否有足够经典容量可用。"""
+        used = self._classical_timeline_load_at(time_point)
+        return (used + demand) <= float(self.classical_resource_limit)
+
+    def _find_earliest_classical_start(self, earliest_ready_time: float, demand_space: float, duration: float) -> float:
+        """在经典时间线上，寻找不违反容量约束的最早起始时刻。"""
+        check_times = [earliest_ready_time]
+        # 使用现有经典分配的结束节点作为候选
+        for job in self.classical_allocations:
+            if job['end'] >= earliest_ready_time:
+                check_times.append(job['end'])
+        check_times = sorted(set(check_times))
+        for t in check_times:
+            if self._classical_has_capacity(t, demand_space):
+                return t
+        # 如未找到，回退为 earliest_ready_time（末尾轻微放宽）
+        return earliest_ready_time
+
+    def _enum_ready_classical_jobs(self, time_now: float):
+        """枚举在 time_now 已就绪且未被调度的经典作业，返回 [(circuit, space, time)]。"""
+        ready = []
+        for c in self.circuits:
+            if c in self.classical_jobs_scheduled:
+                continue
+            plan = getattr(c, 'selected_partition', None)
+            if not plan:
+                continue
+            # 就绪条件：该线路所有选定子线路任务均已完成
+            all_done = True
+            latest_end = 0.0
+            for t in plan:
+                end = getattr(t, 'end_time', None)
+                if end is None or end > time_now:
+                    all_done = False
+                    break
+                latest_end = max(latest_end, end)
+            if all_done:
+                space = float(getattr(c, 'classical_cost_space', 0.0) or 0.0)
+                dur = float(getattr(c, 'classical_cost_time', 0.0) or 0.0)
+                ready.append((c, space, dur, latest_end))
+        return ready
+
+    def _schedule_ready_classical_jobs(self, time_now: float, schedule_log: list):
+        """在经典资源时间线中放置就绪的经典作业。
+        策略：最长处理时间优先（LPT），并在容量允许的最早时刻放置。
+        """
+        ready = self._enum_ready_classical_jobs(time_now)
+        if not ready:
+            return
+        # LPT：按持续时间从长到短
+        ready.sort(key=lambda x: x[2], reverse=True)
+        for circuit, space, dur, ready_time in ready:
+            start_c = self._find_earliest_classical_start(max(time_now, ready_time), space, dur)
+            # 检查容量
+            if not self._classical_has_capacity(start_c, space):
+                continue
+            end_c = start_c + dur
+            self.classical_allocations.append({'circuit': circuit, 'start': start_c, 'end': end_c, 'space': space})
+            self.classical_jobs_scheduled.add(circuit)
+            schedule_log.append({'event': 'run_classical', 'circuit': getattr(circuit, 'name', None), 'start': start_c, 'end': end_c, 'space': space})
+
+    def _dynamic_alpha(self, time_now: float, alpha_base: float) -> float:
+        """根据经典侧拥塞动态调整量子侧权重 α。
+        拥塞度 proxy：
+          - ready 的经典作业总空间占比 = sum(space_ready)/limit
+          - 当前时刻经典时间线利用率 = used/limit
+        取两者的最大值作为拥塞度 c ∈ [0, 1+]，并按 α = α_base * (1 - k*c) 调整。
+        k 默认取 0.7，保证经典侧明显拥塞时显著下调 α。
+        """
+        try:
+            ready = self._enum_ready_classical_jobs(time_now)
+            sum_ready_space = sum(float(s or 0.0) for _, s, _, _ in ready) if ready else 0.0
+            limit = float(self.classical_resource_limit)
+            ratio_ready = (sum_ready_space / limit) if limit > 0 else 0.0
+            used_now = self._classical_timeline_load_at(time_now)
+            ratio_used = (used_now / limit) if limit > 0 else 0.0
+            congestion = max(0.0, ratio_ready, ratio_used)
+            k = 0.7
+            return max(0.0, alpha_base * (1.0 - k * congestion))
+        except Exception:
+            return alpha_base

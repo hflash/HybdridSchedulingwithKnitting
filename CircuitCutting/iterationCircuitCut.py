@@ -14,7 +14,8 @@ try:
         transpile_to_region,
         compute_swap_cnot_counts_per_logical,
         find_feasible_regions_for_circuit,
-        find_best_region_by_avg_performance
+        find_best_region_by_avg_performance,
+        estimate_partition_budgets,
     )
 except ImportError:
     print("Warning: 无法导入performanceAccessing模块的函数，部分功能可能不可用")
@@ -1180,7 +1181,8 @@ def compute_subcircuits_with_budget(circuit, budget, device_qubit_max,
         remaining = len(Greduced.nodes())
         base_parts = max(1, math.ceil(remaining / device_qubit_max))
         best_local = None  # (used, cuts, membership, removed_nodes, parts)
-        for parts in range(base_parts, remaining + 1):
+        max_parts = math.floor(remaining / 2)  + 1 
+        for parts in range(base_parts, max_parts):
             cuts, membership = metis_zmz(Greduced, parts, removed_nodes=removed_nodes)
             used = cuts + len(removed_nodes)
             if used <= budget:
@@ -1487,32 +1489,36 @@ if __name__ == "__main__":
     for fname in qasm_files:
         fpath = os.path.join(folder, fname)
         print(f"\n=== 文件: {fname} | 预算={budget} | device_qubit_max={device_qubit_max} | 芯片={chip_name} ===")
+        
         try:
             circuit = read_circuit(fpath)
-            res = compute_subcircuits_with_budget(
-                circuit=circuit,
-                budget=budget,
-                device_qubit_max=device_qubit_max,
-                chip_name=chip_name,
-                two_q_gate_name='cx',
-                max_regions=200,
-                excluded_qubits=None
-            )
-            print(f"status: {res['status']}, message: {res['message']}")
-            if res['status'] == 'ok':
-                print(f"used_budget: {res['used_budget']}, cuts: {res['cuts']}, parts: {res['parts']}")
-                print(f"post_swap_applied: {res['post_swap_applied']}")
-                print(f"生成子线路数: {len(res['subcircuits'])}")
-                for i, sc in enumerate(res['subcircuits']):
-                    print(f"  子线路 {i}: qubits={sc.num_qubits}, depth={sc.depth()}")
-                # 新增：打印每个子线路与其他子线路之间的割数量(权重和)
-                per_counts = res.get('per_subcircuit_cut_counts', {})
-                if per_counts:
-                    print("各子线路与其他子线路之间的割数量(权重和):")
-                    for g in sorted(per_counts.keys()):
-                        print(f"  组 {g}: {per_counts[g]}")
-            else:
-                print("无法执行，需增加预算")
+            
+            budgets_info = estimate_partition_budgets(qc, device_qubit_max)
+            print(budgets_info['budgets_int'])
+            # res = compute_subcircuits_with_budget(
+            #     circuit=circuit,
+            #     budget=budget,
+            #     device_qubit_max=device_qubit_max,
+            #     chip_name=chip_name,
+            #     two_q_gate_name='cx',
+            #     max_regions=200,
+            #     excluded_qubits=None
+            # )
+            # print(f"status: {res['status']}, message: {res['message']}")
+            # if res['status'] == 'ok':
+            #     print(f"used_budget: {res['used_budget']}, cuts: {res['cuts']}, parts: {res['parts']}")
+            #     print(f"post_swap_applied: {res['post_swap_applied']}")
+            #     print(f"生成子线路数: {len(res['subcircuits'])}")
+            #     for i, sc in enumerate(res['subcircuits']):
+            #         print(f"  子线路 {i}: qubits={sc.num_qubits}, depth={sc.depth()}")
+            #     # 新增：打印每个子线路与其他子线路之间的割数量(权重和)
+            #     per_counts = res.get('per_subcircuit_cut_counts', {})
+            #     if per_counts:
+            #         print("各子线路与其他子线路之间的割数量(权重和):")
+            #         for g in sorted(per_counts.keys()):
+            #             print(f"  组 {g}: {per_counts[g]}")
+            # else:
+            #     print("无法执行，需增加预算")
         except Exception as e:
             print(f"[跳过] {fname}: {e}")
 

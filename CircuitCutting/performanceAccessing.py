@@ -5,7 +5,7 @@ import os
 # from qiskit.providers.fake_provider import fake_provider
 from qiskit_ibm_runtime.fake_provider import FakeManilaV2, FakeGuadalupeV2, FakeHanoiV2, FakeMelbourneV2, FakeManhattanV2
 import math
-from .iterationCircuitCut import read_circuit, compute_subcircuits_with_budget
+from iterationCircuitCut import read_circuit, compute_subcircuits_with_budget
 
 # 固定随机种子，稳定SABRE与其他启发式行为
 SEED_TRANSPILE = 12345
@@ -1394,6 +1394,55 @@ def estimate_partition_budgets(
     }
 
 if __name__ == "__main__":
+
+    base_path = "/home/normaluser/hflash/HybdridSchedulingwithKnitting/Benchmark/"
+    # folder = base_path + "pra_benchmark/small_scale"  # 可换 qaoa/qft/rca/vqe 等
+    folder = "/home/normaluser/fzchen/HybdridSchedulingwithKnitting/testqasm/"
+    device_qubit_max = 65
+    budget = 10
+    chip_name = "FakeManhattanV2"
+    limit = 5  # 只测前5个文件
+
+    qasm_files = [f for f in sorted(os.listdir(folder)) if f.endswith(".qasm")][:limit]
+
+    for fname in qasm_files:
+        fpath = os.path.join(folder, fname)
+        print(f"\n=== 文件: {fname} | 预算={budget} | device_qubit_max={device_qubit_max} | 芯片={chip_name} ===")
+        
+        try:
+            circuit = read_circuit(fpath)
+            
+            budgets_info = estimate_partition_budgets(circuit, device_qubit_max)
+            print(budgets_info['budgets_int'])
+            # res = compute_subcircuits_with_budget(
+            #     circuit=circuit,
+            #     budget=budget,
+            #     device_qubit_max=device_qubit_max,
+            #     chip_name=chip_name,
+            #     two_q_gate_name='cx',
+            #     max_regions=200,
+            #     excluded_qubits=None
+            # )
+            # print(f"status: {res['status']}, message: {res['message']}")
+            # if res['status'] == 'ok':
+            #     print(f"used_budget: {res['used_budget']}, cuts: {res['cuts']}, parts: {res['parts']}")
+            #     print(f"post_swap_applied: {res['post_swap_applied']}")
+            #     print(f"生成子线路数: {len(res['subcircuits'])}")
+            #     for i, sc in enumerate(res['subcircuits']):
+            #         print(f"  子线路 {i}: qubits={sc.num_qubits}, depth={sc.depth()}")
+            #     # 新增：打印每个子线路与其他子线路之间的割数量(权重和)
+            #     per_counts = res.get('per_subcircuit_cut_counts', {})
+            #     if per_counts:
+            #         print("各子线路与其他子线路之间的割数量(权重和):")
+            #         for g in sorted(per_counts.keys()):
+            #             print(f"  组 {g}: {per_counts[g]}")
+            # else:
+            #     print("无法执行，需增加预算")
+        except Exception as e:
+            print(f"[跳过] {fname}: {e}")
+
+
+
     # macros = compute_ibm_fake_macro_averages()
     # print(macros)
     # 可选：将全局宏覆盖为建议均值
@@ -1507,43 +1556,43 @@ if __name__ == "__main__":
     # print(estimate_best_fidelity_and_logical_stats(circuit, 'FakeHanoiV2', two_q_gate_name='cx', max_regions=200, excluded_qubits=None))
 
 
-    stats = compute_fidelity_requirement(mapped_circ)
-    print("two_qubit_gates:", stats['two_qubit_gates'])
-    print("one_qubit_gates:", stats['one_qubit_gates'])
-    print("measured_qubits:", stats['measured_qubits'])
-    print("depth:", stats['depth'])
-    print("exec_time_seconds:", stats['exec_time_seconds'])
-    print("deco_factor:", stats['deco_factor'])
-    print("fidelity_requirement:", stats['fidelity_requirement'])
-    print("macros:", stats['macros'])
+    # stats = compute_fidelity_requirement(mapped_circ)
+    # print("two_qubit_gates:", stats['two_qubit_gates'])
+    # print("one_qubit_gates:", stats['one_qubit_gates'])
+    # print("measured_qubits:", stats['measured_qubits'])
+    # print("depth:", stats['depth'])
+    # print("exec_time_seconds:", stats['exec_time_seconds'])
+    # print("deco_factor:", stats['deco_factor'])
+    # print("fidelity_requirement:", stats['fidelity_requirement'])
+    # print("macros:", stats['macros'])
 
-    # 路径与后端
-    base_path = "/home/normaluser/hflash/HybdridSchedulingwithKnitting/Benchmark/"
-    qasm_path = base_path + "pra_benchmark/small_scale/cm82a_208.qasm"
-    backend = FakeMelbourneV2()
-    qc = read_circuit(qasm_path)
+    # # 路径与后端
+    # base_path = "/home/normaluser/hflash/HybdridSchedulingwithKnitting/Benchmark/"
+    # qasm_path = base_path + "pra_benchmark/small_scale/cm82a_208.qasm"
+    # backend = FakeMelbourneV2()
+    # qc = read_circuit(qasm_path)
 
-    # 找一个最佳区域并映射，用其执行时间作为预算函数的 t
-    best = find_best_region_by_avg_performance(qc, backend, two_q_gate_name='cx', excluded_qubits=None, weight=0.5, max_regions=200)
-    region = best['region']
-    mapped = transpile_to_region(qc, backend, region)
-    t_seconds, _ = estimate_time_and_fidelity(mapped, backend)
+    # # 找一个最佳区域并映射，用其执行时间作为预算函数的 t
+    # best = find_best_region_by_avg_performance(qc, backend, two_q_gate_name='cx', excluded_qubits=None, weight=0.5, max_regions=200)
+    # region = best['region']
+    # mapped = transpile_to_region(qc, backend, region)
+    # t_seconds, _ = estimate_time_and_fidelity(mapped, backend)
 
-    # 设备规模（示例：Melbourne 15）
-    device_qubit_max = backend.num_qubits
+    # # 设备规模（示例：Melbourne 15）
+    # device_qubit_max = backend.num_qubits
 
-    # 估计三档预算
-    res = estimate_partition_budgets(
-        qc,
-        device_qubit_max=device_qubit_max,
-        B0=1.0, alpha=1.0, beta=1.0, eta=1.0,
-        gammas=(0.5, 1.0, 2.0)
-    )
+    # # 估计三档预算
+    # res = estimate_partition_budgets(
+    #     qc,
+    #     device_qubit_max=device_qubit_max,
+    #     B0=1.0, alpha=1.0, beta=1.0, eta=1.0,
+    #     gammas=(0.5, 1.0, 2.0)
+    # )
 
-    print("budgets_float:", res['budgets_float'])
-    print("budgets_int:", res['budgets_int'])
-    print("F_cluster:", res['F_cluster'])
-    print("F_cluster_factors:", res['F_cluster_factors'])
-    print("S, r_Q, d_2q:", res['S'], res['r_Q'], res['d_2q'])
-    print("F_min, H, B_base:", res['F_min'], res['H'], res['B_base'])
+    # print("budgets_float:", res['budgets_float'])
+    # print("budgets_int:", res['budgets_int'])
+    # print("F_cluster:", res['F_cluster'])
+    # print("F_cluster_factors:", res['F_cluster_factors'])
+    # print("S, r_Q, d_2q:", res['S'], res['r_Q'], res['d_2q'])
+    # print("F_min, H, B_base:", res['F_min'], res['H'], res['B_base'])
     
